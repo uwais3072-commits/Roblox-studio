@@ -1,0 +1,2550 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+import * as THREE from "three";
+import appSource from "./App.tsx?raw";
+
+// ── UI Click sound ─────────────────────────────────────────────────────────────
+function playClick(freq=900) {
+  try {
+    const AC = window.AudioContext || (window as unknown as {webkitAudioContext: typeof AudioContext}).webkitAudioContext;
+    const ctx=new AC();
+    const o=ctx.createOscillator(), g=ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.type="sine";
+    o.frequency.setValueAtTime(freq, ctx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(freq*0.4, ctx.currentTime+0.06);
+    g.gain.setValueAtTime(0.12, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime+0.09);
+    o.start(ctx.currentTime); o.stop(ctx.currentTime+0.09);
+  } catch { /* ignore */ }
+}
+
+// ── Tree helpers ───────────────────────────────────────────────────────────────
+function mapTree(nodes: TreeNode[], id: string, fn: (n: TreeNode) => TreeNode): TreeNode[] {
+  return nodes.map(n => {
+    if (n.id === id) return fn(n);
+    if (n.children) return { ...n, children: mapTree(n.children, id, fn) };
+    return n;
+  });
+}
+function removeFromTree(nodes: TreeNode[], id: string): TreeNode[] {
+  return nodes.map(n => ({
+    ...n,
+    children: n.children ? removeFromTree(n.children.filter(c => c.id !== id), id) : undefined
+  }));
+}
+function findInTree(nodes: TreeNode[], id: string): TreeNode | null {
+  for (const n of nodes) {
+    if (n.id === id) return n;
+    if (n.children) { const f = findInTree(n.children, id); if (f) return f; }
+  }
+  return null;
+}
+
+// ── Types ──────────────────────────────────────────────────────────────────────
+interface TreeNode {
+  id: string; name: string; icon: string; open?: boolean;
+  children?: TreeNode[];
+  scriptContent?: string; scriptType?: string;
+  soundUrl?: string;
+}
+interface SceneObj {
+  id: string; name: string; type: string; color: string;
+  position: [number,number,number]; size: [number,number,number];
+  anchored?: boolean; material?: string; emissive?: boolean;
+  transparency?: number; canCollide?: boolean;
+}
+interface InsertMenu { parentId: string; x: number; y: number; }
+interface ScriptModal { nodeId: string; name: string; type: string; content: string; }
+interface SkySettings { bgColor: string; fogColor: string; fogFar: number; ambientInt: number; sunInt: number; sunAngle: number; }
+interface SavedProject { name: string; date: string; objs: SceneObj[]; tree: TreeNode[]; }
+
+// ── Constants ──────────────────────────────────────────────────────────────────
+const TREE_INIT: TreeNode[] = [
+  { id:"workspace", name:"Workspace", icon:"📁", open:true, children:[
+    { id:"camera",    name:"Camera",        icon:"📷", children:[] },
+    { id:"baseplate", name:"Baseplate",     icon:"🟩", children:[] },
+    { id:"spawn",     name:"SpawnLocation", icon:"🏠", children:[] },
+  ]},
+  { id:"players",    name:"Players",              icon:"👥", open:false, children:[] },
+  { id:"lighting",   name:"Lighting",             icon:"💡", open:false, children:[
+    { id:"amb", name:"Ambient", icon:"💡", children:[] },
+    { id:"sky", name:"Sky",     icon:"🌤",  children:[] },
+  ]},
+  { id:"starterGui",  name:"StarterGui",      icon:"📁", open:false, children:[{ id:"screenGui", name:"ScreenGui", icon:"📁", children:[] }]},
+  { id:"starterPack", name:"StarterPack",     icon:"📦", open:false, children:[] },
+  { id:"serverScript",name:"ServerScriptService", icon:"📜", open:false, children:[
+    { id:"gameMgr", name:"GameManager", icon:"📜", children:[], scriptType:"script",
+      scriptContent:`-- GameManager Script\nlocal colors = {Color3.fromRGB(255,0,0),Color3.fromRGB(0,255,0),Color3.fromRGB(0,0,255)}\nlocal i=1\nwhile true do\n  for _,p in ipairs(workspace:GetChildren()) do\n    if p:IsA("BasePart") then p.BrickColor=BrickColor.new(colors[i]) end\n  end\n  i=(i%#colors)+1; wait(0.5)\nend\n` }
+  ]},
+  { id:"repStorage",  name:"ReplicatedStorage",   icon:"📁", open:false, children:[] },
+  { id:"serverStore", name:"ServerStorage",        icon:"📁", open:false, children:[] },
+  { id:"soundSvc",    name:"SoundService",         icon:"🔊", open:false, children:[
+    { id:"bgm", name:"BackgroundMusic", icon:"🎵", children:[], soundUrl:"" }
+  ]},
+  { id:"teams",    name:"Teams",      icon:"📁", open:false, children:[] },
+  { id:"runSvc",   name:"RunService", icon:"📁", open:false, children:[] },
+];
+
+const INSERT_ITEMS = [
+  { type:"script",       name:"Script",       emoji:"📜", color:"#4ade80",
+    defaultContent:`-- Script baru\nlocal part=Instance.new("Part")\npart.Parent=workspace\npart.Position=Vector3.new(0,5,0)\nwhile true do\n  part.CFrame=part.CFrame*CFrame.Angles(0,math.rad(3),0)\n  wait(0.05)\nend\n` },
+  { type:"localscript",  name:"LocalScript",  emoji:"📜", color:"#60a5fa", defaultContent:`-- LocalScript\nlocal p=game.Players.LocalPlayer\nprint("Player:", p.Name)\n` },
+  { type:"modulescript", name:"ModuleScript", emoji:"📜", color:"#f59e0b", defaultContent:`local M={}\nfunction M.hello() print("Hello!") end\nreturn M\n` },
+  { type:"textlabel",    name:"TextLabel",    emoji:"🔤", color:"#c084fc", defaultContent:"" },
+  { type:"imagelabel",   name:"ImageLabel",   emoji:"🖼",  color:"#fb923c", defaultContent:"" },
+  { type:"folder",       name:"Folder",       emoji:"📁", color:"#94a3b8", defaultContent:"" },
+  { type:"sound",        name:"Sound",        emoji:"🎵", color:"#34d399", defaultContent:"" },
+];
+
+interface CompoundPart { name:string; color:string; relPos:[number,number,number]; size:[number,number,number]; }
+interface CompoundModel { label:string; icon:string; parts:CompoundPart[]; }
+
+const COMPOUND_TOOLBOX: CompoundModel[] = [
+  { label:"🏠 House", icon:"🏠", parts:[
+    { name:"Foundation", color:"#7f8c8d", relPos:[0,0.25,0],    size:[8,0.5,8]   },
+    { name:"WallFront",  color:"#c0392b", relPos:[0,3,-4],       size:[8,5,0.4]   },
+    { name:"WallBack",   color:"#c0392b", relPos:[0,3,4],        size:[8,5,0.4]   },
+    { name:"WallLeft",   color:"#c0392b", relPos:[-4,3,0],       size:[0.4,5,8]   },
+    { name:"WallRight",  color:"#c0392b", relPos:[4,3,0],        size:[0.4,5,8]   },
+    { name:"Roof",       color:"#6b3a00", relPos:[0,6,0],        size:[9,1.5,9]   },
+    { name:"Door",       color:"#4a2f00", relPos:[0,1.5,-4.3],   size:[2,3,0.3]   },
+    { name:"WindowL",    color:"#87ceeb", relPos:[-2.5,3.5,-4.3],size:[2,2,0.2]   },
+    { name:"WindowR",    color:"#87ceeb", relPos:[2.5,3.5,-4.3], size:[2,2,0.2]   },
+  ]},
+  { label:"🚗 Car", icon:"🚗", parts:[
+    { name:"Body",    color:"#2980b9", relPos:[0,1,0],       size:[4,1.2,8]   },
+    { name:"Cabin",   color:"#1a5276", relPos:[0,2.2,-0.5],  size:[3.5,1.2,4] },
+    { name:"WheelFL", color:"#1a1a1a", relPos:[-2.3,0.5,2.8], size:[0.8,1.2,1.2]},
+    { name:"WheelFR", color:"#1a1a1a", relPos:[2.3,0.5,2.8],  size:[0.8,1.2,1.2]},
+    { name:"WheelBL", color:"#1a1a1a", relPos:[-2.3,0.5,-2.8],size:[0.8,1.2,1.2]},
+    { name:"WheelBR", color:"#1a1a1a", relPos:[2.3,0.5,-2.8], size:[0.8,1.2,1.2]},
+  ]},
+  { label:"🌳 Tree", icon:"🌳", parts:[
+    { name:"Trunk",     color:"#6b3a00", relPos:[0,2,0], size:[1,4,1]   },
+    { name:"LeavesBot", color:"#1a7a1a", relPos:[0,5,0], size:[5,2,5]   },
+    { name:"LeavesMid", color:"#27ae60", relPos:[0,7,0], size:[3.5,2,3.5]},
+    { name:"LeavesTop", color:"#2ecc71", relPos:[0,9,0], size:[2,2,2]   },
+  ]},
+  { label:"🪑 Chair", icon:"🪑", parts:[
+    { name:"Seat",    color:"#8B4513", relPos:[0,1.1,0],    size:[2,0.25,2]   },
+    { name:"Backrest",color:"#8B4513", relPos:[0,2.1,-0.9], size:[2,1.5,0.2]  },
+    { name:"LegFL",   color:"#5c2f00", relPos:[-0.8,0.5,0.8],  size:[0.25,1,0.25]},
+    { name:"LegFR",   color:"#5c2f00", relPos:[0.8,0.5,0.8],   size:[0.25,1,0.25]},
+    { name:"LegBL",   color:"#5c2f00", relPos:[-0.8,0.5,-0.8], size:[0.25,1,0.25]},
+    { name:"LegBR",   color:"#5c2f00", relPos:[0.8,0.5,-0.8],  size:[0.25,1,0.25]},
+  ]},
+  { label:"🚪 Door",   icon:"🚪", parts:[
+    { name:"Frame",  color:"#8B6914", relPos:[0,2.5,0],    size:[3,5.2,0.3]  },
+    { name:"Panel",  color:"#5a4010", relPos:[0,2.3,0.1],  size:[2.5,4.5,0.2]},
+    { name:"Handle", color:"#d4ac0d", relPos:[1,2.3,0.25], size:[0.15,0.4,0.2]},
+  ]},
+  { label:"🪟 Window", icon:"🪟", parts:[
+    { name:"Frame", color:"#f0f0f0", relPos:[0,1.5,0],   size:[3,3,0.3]    },
+    { name:"Glass", color:"#87ceeb", relPos:[0,1.5,0.1], size:[2.5,2.5,0.1]},
+    { name:"Sill",  color:"#cccccc", relPos:[0,0.1,0.15],size:[3.2,0.3,0.5]},
+  ]},
+  { label:"💡 Lamp", icon:"💡", parts:[
+    { name:"Base",  color:"#777777", relPos:[0,0.15,0], size:[0.8,0.3,0.8] },
+    { name:"Post",  color:"#888888", relPos:[0,2.15,0], size:[0.25,4,0.25] },
+    { name:"Shade", color:"#f1c40f", relPos:[0,4.5,0],  size:[1.2,0.8,1.2] },
+    { name:"Bulb",  color:"#fffde7", relPos:[0,4.15,0], size:[0.5,0.5,0.5] },
+  ]},
+  { label:"🧱 Wall",  icon:"🧱", parts:[
+    { name:"Wall",  color:"#7f8c8d", relPos:[0,2,0], size:[8,4,0.4]    },
+    { name:"Line1", color:"#636e72", relPos:[0,1,0], size:[8,0.1,0.45]  },
+    { name:"Line2", color:"#636e72", relPos:[0,2,0], size:[8,0.1,0.45]  },
+    { name:"Line3", color:"#636e72", relPos:[0,3,0], size:[8,0.1,0.45]  },
+  ]},
+  { label:"🪞 Table",icon:"🪞", parts:[
+    { name:"Top",    color:"#8B6914", relPos:[0,2.1,0],    size:[5,0.2,3]    },
+    { name:"LegFL",  color:"#5c4010", relPos:[-2.2,1,1.2], size:[0.3,2,0.3]  },
+    { name:"LegFR",  color:"#5c4010", relPos:[2.2,1,1.2],  size:[0.3,2,0.3]  },
+    { name:"LegBL",  color:"#5c4010", relPos:[-2.2,1,-1.2],size:[0.3,2,0.3]  },
+    { name:"LegBR",  color:"#5c4010", relPos:[2.2,1,-1.2], size:[0.3,2,0.3]  },
+  ]},
+  { label:"🛋 Sofa",  icon:"🛋", parts:[
+    { name:"Base",   color:"#8B5E3C", relPos:[0,0.7,0],    size:[6,1.4,2.5]  },
+    { name:"Back",   color:"#7a4f2d", relPos:[0,2,-1.1],   size:[6,1.6,0.4]  },
+    { name:"ArmL",   color:"#7a4f2d", relPos:[-2.9,1.6,0], size:[0.4,1.2,2.5]},
+    { name:"ArmR",   color:"#7a4f2d", relPos:[2.9,1.6,0],  size:[0.4,1.2,2.5]},
+    { name:"Cushion",color:"#c17f5a", relPos:[0,1.5,-0.2], size:[5.5,0.4,2]  },
+  ]},
+  { label:"📚 Bookshelf",icon:"📚", parts:[
+    { name:"Left",   color:"#6b3a00", relPos:[-2,2.5,0],   size:[0.3,5.5,1.2]},
+    { name:"Right",  color:"#6b3a00", relPos:[2,2.5,0],    size:[0.3,5.5,1.2]},
+    { name:"Top",    color:"#6b3a00", relPos:[0,5.2,0],    size:[4.4,0.3,1.2]},
+    { name:"Bot",    color:"#6b3a00", relPos:[0,0.1,0],    size:[4.4,0.3,1.2]},
+    { name:"Shelf1", color:"#8B5e3c", relPos:[0,1.7,0],    size:[4.4,0.2,1.2]},
+    { name:"Shelf2", color:"#8B5e3c", relPos:[0,3.4,0],    size:[4.4,0.2,1.2]},
+    { name:"Book1",  color:"#e74c3c", relPos:[-1.5,2.4,0], size:[0.6,1.3,1]  },
+    { name:"Book2",  color:"#2980b9", relPos:[-0.7,2.4,0], size:[0.6,1.3,1]  },
+    { name:"Book3",  color:"#27ae60", relPos:[0.2,2.4,0],  size:[0.5,1.3,1]  },
+    { name:"Book4",  color:"#9b59b6", relPos:[1,2.4,0],    size:[0.7,1.3,1]  },
+  ]},
+  { label:"🚚 Truck", icon:"🚚", parts:[
+    { name:"Cargo",  color:"#95a5a6", relPos:[1.5,2,0],    size:[7,3,3]      },
+    { name:"Cab",    color:"#2c3e50", relPos:[-2.5,1.7,0], size:[3,2.5,3]    },
+    { name:"WhlFL",  color:"#1a1a1a", relPos:[-3.2,0.6,1.7],size:[0.8,1.4,1.4]},
+    { name:"WhlFR",  color:"#1a1a1a", relPos:[-3.2,0.6,-1.7],size:[0.8,1.4,1.4]},
+    { name:"WhlBL1", color:"#1a1a1a", relPos:[1,0.6,1.7],  size:[0.8,1.4,1.4]},
+    { name:"WhlBR1", color:"#1a1a1a", relPos:[1,0.6,-1.7], size:[0.8,1.4,1.4]},
+    { name:"WhlBL2", color:"#1a1a1a", relPos:[2.5,0.6,1.7],size:[0.8,1.4,1.4]},
+    { name:"WhlBR2", color:"#1a1a1a", relPos:[2.5,0.6,-1.7],size:[0.8,1.4,1.4]},
+  ]},
+  { label:"✈ Airplane",icon:"✈", parts:[
+    { name:"Fuselage",color:"#ecf0f1",relPos:[0,0,0],       size:[14,2,2]    },
+    { name:"WingL",   color:"#bdc3c7",relPos:[0,0,5],       size:[6,0.3,8]   },
+    { name:"WingR",   color:"#bdc3c7",relPos:[0,0,-5],      size:[6,0.3,8]   },
+    { name:"TailV",   color:"#bdc3c7",relPos:[-6,1.5,0],    size:[0.3,3,2]   },
+    { name:"TailHL",  color:"#bdc3c7",relPos:[-6,0,2],      size:[2,0.3,3]   },
+    { name:"TailHR",  color:"#bdc3c7",relPos:[-6,0,-2],     size:[2,0.3,3]   },
+    { name:"Engine1", color:"#95a5a6",relPos:[1,0,4.5],     size:[1.5,1.5,3] },
+    { name:"Engine2", color:"#95a5a6",relPos:[1,0,-4.5],    size:[1.5,1.5,3] },
+    { name:"Cockpit", color:"#87ceeb",relPos:[6.5,0.3,0],   size:[1.5,1.5,1.5]},
+  ]},
+  { label:"🚢 Boat",  icon:"🚢", parts:[
+    { name:"Hull",   color:"#c0392b", relPos:[0,1,0],       size:[12,2,5]    },
+    { name:"Deck",   color:"#f0e0c0", relPos:[0,2.3,0],     size:[11,0.4,4.5]},
+    { name:"Cabin",  color:"#ecf0f1", relPos:[0,4,0],       size:[5,3,3]     },
+    { name:"Chimney",color:"#2c3e50", relPos:[1,6.5,0],     size:[0.8,2.5,0.8]},
+    { name:"Mast",   color:"#8B6914", relPos:[4,6,0],       size:[0.25,8,0.25]},
+    { name:"BowL",   color:"#a02020", relPos:[-5.5,0.8,1.5],size:[1.5,1.5,2]  },
+    { name:"BowR",   color:"#a02020", relPos:[-5.5,0.8,-1.5],size:[1.5,1.5,2] },
+  ]},
+  { label:"🚀 Rocket", icon:"🚀", parts:[
+    { name:"Body",   color:"#ecf0f1", relPos:[0,5,0],       size:[2,8,2]     },
+    { name:"Nose",   color:"#e74c3c", relPos:[0,10,0],      size:[1.5,3,1.5] },
+    { name:"FinFL",  color:"#bdc3c7", relPos:[0,2,-1.5],    size:[0.3,3,2]   },
+    { name:"FinFR",  color:"#bdc3c7", relPos:[0,2,1.5],     size:[0.3,3,2]   },
+    { name:"FinBL",  color:"#bdc3c7", relPos:[-1.5,2,0],    size:[2,3,0.3]   },
+    { name:"FinBR",  color:"#bdc3c7", relPos:[1.5,2,0],     size:[2,3,0.3]   },
+    { name:"Nozzle", color:"#7f8c8d", relPos:[0,0.5,0],     size:[1.8,1.5,1.8]},
+    { name:"Flame",  color:"#ff6600", relPos:[0,-0.8,0],    size:[1.2,2,1.2] },
+  ]},
+  { label:"🏰 Castle",icon:"🏰", parts:[
+    { name:"Wall1",  color:"#7f8c8d", relPos:[0,3,-6],      size:[14,6,0.8]  },
+    { name:"Wall2",  color:"#7f8c8d", relPos:[0,3,6],       size:[14,6,0.8]  },
+    { name:"Wall3",  color:"#7f8c8d", relPos:[-6,3,0],      size:[0.8,6,12]  },
+    { name:"Wall4",  color:"#7f8c8d", relPos:[6,3,0],       size:[0.8,6,12]  },
+    { name:"TowerFL",color:"#6b7b8c", relPos:[-6,5,-6],     size:[2.5,10,2.5]},
+    { name:"TowerFR",color:"#6b7b8c", relPos:[6,5,-6],      size:[2.5,10,2.5]},
+    { name:"TowerBL",color:"#6b7b8c", relPos:[-6,5,6],      size:[2.5,10,2.5]},
+    { name:"TowerBR",color:"#6b7b8c", relPos:[6,5,6],       size:[2.5,10,2.5]},
+    { name:"Gate",   color:"#3d2b1f", relPos:[0,1.5,-6.5],  size:[3,4,0.4]   },
+    { name:"Floor",  color:"#95a5a6", relPos:[0,0,0],       size:[12,0.4,12] },
+  ]},
+  { label:"🏗 Skyscraper",icon:"🏗", parts:[
+    { name:"Base",  color:"#2c3e50",relPos:[0,8,0],         size:[8,16,8]    },
+    { name:"Mid",   color:"#34495e",relPos:[0,22,0],        size:[6,12,6]    },
+    { name:"Top",   color:"#2980b9",relPos:[0,33,0],        size:[4,10,4]    },
+    { name:"Spire", color:"#ecf0f1",relPos:[0,41,0],        size:[1,8,1]     },
+    { name:"WinA1", color:"#87ceeb",relPos:[-3.6,5,0],      size:[0.1,14,6]  },
+    { name:"WinA2", color:"#87ceeb",relPos:[3.6,5,0],       size:[0.1,14,6]  },
+  ]},
+  { label:"⛪ Church",  icon:"⛪", parts:[
+    { name:"Nave",  color:"#d5c9b0",relPos:[0,3,0],         size:[8,6,12]    },
+    { name:"SteepleBase",color:"#c4b89a",relPos:[0,8,-5],   size:[4,4,4]     },
+    { name:"Steeple",color:"#8B7355",relPos:[0,12,-5],      size:[2.5,6,2.5] },
+    { name:"Cross", color:"#ecf0f1",relPos:[0,16,-5],       size:[0.4,3,0.4] },
+    { name:"CrossB",color:"#ecf0f1",relPos:[0,15,-5],       size:[2,0.4,0.4] },
+    { name:"Door",  color:"#4a2f00",relPos:[0,2,-6.1],      size:[2.5,4,0.3] },
+  ]},
+  { label:"🌴 Palm Tree",icon:"🌴", parts:[
+    { name:"Trunk1",color:"#8B6914",relPos:[0,2,0],         size:[0.8,4,0.8] },
+    { name:"Trunk2",color:"#9B7920",relPos:[0.3,5,0],       size:[0.7,3,0.7] },
+    { name:"Trunk3",color:"#8B6914",relPos:[0.5,7,0],       size:[0.6,2,0.6] },
+    { name:"Leaf1", color:"#2d8a2d",relPos:[2,8.5,0],       size:[4,0.3,1]   },
+    { name:"Leaf2", color:"#2d8a2d",relPos:[-2,8.5,0],      size:[4,0.3,1]   },
+    { name:"Leaf3", color:"#2d8a2d",relPos:[0,8.5,2],       size:[1,0.3,4]   },
+    { name:"Leaf4", color:"#2d8a2d",relPos:[0,8.5,-2],      size:[1,0.3,4]   },
+    { name:"Leaf5", color:"#27ae27",relPos:[1.5,8.5,1.5],   size:[3,0.3,3]   },
+    { name:"Coconut",color:"#8B4513",relPos:[0.5,8,0],      size:[0.8,0.8,0.8]},
+  ]},
+  { label:"🌵 Cactus",  icon:"🌵", parts:[
+    { name:"Body",  color:"#2a7a2a",relPos:[0,3,0],         size:[1.2,6,1.2] },
+    { name:"ArmL",  color:"#2a7a2a",relPos:[-1.8,3.5,0],   size:[2.5,1,1]   },
+    { name:"ArmLU", color:"#2a7a2a",relPos:[-3,5,0],        size:[1,2.5,1]   },
+    { name:"ArmR",  color:"#2a7a2a",relPos:[1.8,4,0],       size:[2.5,1,1]   },
+    { name:"ArmRU", color:"#2a7a2a",relPos:[3,5.5,0],       size:[1,2,1]     },
+  ]},
+  { label:"🍄 Mushroom",icon:"🍄", parts:[
+    { name:"Stem",  color:"#f5deb3",relPos:[0,1.5,0],       size:[1.5,3,1.5] },
+    { name:"Cap",   color:"#e74c3c",relPos:[0,4,0],         size:[5,2,5]     },
+    { name:"CapTop",color:"#c0392b",relPos:[0,5.2,0],       size:[3,1,3]     },
+    { name:"Spot1", color:"#ecf0f1",relPos:[-1.5,4.8,-0.5], size:[0.7,0.3,0.7]},
+    { name:"Spot2", color:"#ecf0f1",relPos:[1,4.8,1],       size:[0.6,0.3,0.6]},
+  ]},
+  { label:"🏮 Lantern", icon:"🏮", parts:[
+    { name:"Post",  color:"#333333",relPos:[0,2,0],         size:[0.2,4,0.2] },
+    { name:"Arm",   color:"#333333",relPos:[1,4.2,0],       size:[2,0.2,0.2] },
+    { name:"Body",  color:"#f59e0b",relPos:[2,3.8,0],       size:[0.8,1.5,0.8]},
+    { name:"Top",   color:"#333333",relPos:[2,4.7,0],       size:[1,0.3,1]   },
+    { name:"Glow",  color:"#fff9c4",relPos:[2,3.8,0],       size:[0.5,1,0.5] },
+  ]},
+  { label:"🏺 Column",  icon:"🏺", parts:[
+    { name:"Base",  color:"#d4cdb8",relPos:[0,0.4,0],       size:[2.5,0.8,2.5]},
+    { name:"Shaft", color:"#e0d9c3",relPos:[0,3.5,0],       size:[1.8,5.8,1.8]},
+    { name:"Cap",   color:"#d4cdb8",relPos:[0,6.8,0],       size:[2.5,0.8,2.5]},
+    { name:"Capitel",color:"#c8c0a8",relPos:[0,7.5,0],      size:[3,0.6,3]   },
+  ]},
+  { label:"🌊 Arch Bridge",icon:"🌊", parts:[
+    { name:"Deck",  color:"#95a5a6",relPos:[0,3.5,0],       size:[16,0.5,3]  },
+    { name:"ArchL", color:"#7f8c8d",relPos:[-4,2,0],        size:[1,4,3]     },
+    { name:"ArchR", color:"#7f8c8d",relPos:[4,2,0],         size:[1,4,3]     },
+    { name:"Pier1", color:"#7f8c8d",relPos:[-4,0.5,0],      size:[1.5,2,3]   },
+    { name:"Pier2", color:"#7f8c8d",relPos:[4,0.5,0],       size:[1.5,2,3]   },
+    { name:"Railing1",color:"#bdc3c7",relPos:[0,4.2,1.4],   size:[16,0.5,0.2]},
+    { name:"Railing2",color:"#bdc3c7",relPos:[0,4.2,-1.4],  size:[16,0.5,0.2]},
+  ]},
+  { label:"🏮 Gate",    icon:"🏮", parts:[
+    { name:"PostL", color:"#8B6914",relPos:[-3,3,0],        size:[0.8,6,0.8] },
+    { name:"PostR", color:"#8B6914",relPos:[3,3,0],         size:[0.8,6,0.8] },
+    { name:"Top",   color:"#8B6914",relPos:[0,6.2,0],       size:[7,0.6,0.8] },
+    { name:"DoorL", color:"#6b4a10",relPos:[-1.5,2.5,0],    size:[2.5,5,0.2] },
+    { name:"DoorR", color:"#6b4a10",relPos:[1.5,2.5,0],     size:[2.5,5,0.2] },
+    { name:"Handle",color:"#d4ac0d",relPos:[0,2.5,0.2],     size:[0.3,0.6,0.2]},
+  ]},
+  { label:"⛽ Fuel Pump",icon:"⛽", parts:[
+    { name:"Body",  color:"#e74c3c",relPos:[0,1.8,0],       size:[1.5,3,0.8] },
+    { name:"Base",  color:"#c0392b",relPos:[0,0.2,0],       size:[2,0.5,1.5] },
+    { name:"Screen",color:"#2c3e50",relPos:[0,2.5,0.45],    size:[1,1.2,0.1] },
+    { name:"Nozzle",color:"#333333",relPos:[1,2,0.45],      size:[0.8,0.4,0.2]},
+    { name:"Hose",  color:"#222222",relPos:[1.5,1.5,0.3],   size:[0.2,2,0.2] },
+  ]},
+  { label:"🚦 Traffic Light",icon:"🚦", parts:[
+    { name:"Post",  color:"#333333",relPos:[0,2.5,0],       size:[0.3,5,0.3] },
+    { name:"Box",   color:"#2c3e50",relPos:[0,5.3,0],       size:[0.8,2.5,0.8]},
+    { name:"Red",   color:"#ff0000",relPos:[0,6.3,0.45],    size:[0.5,0.5,0.1]},
+    { name:"Yellow",color:"#ffff00",relPos:[0,5.5,0.45],    size:[0.5,0.5,0.1]},
+    { name:"Green", color:"#00ff00",relPos:[0,4.7,0.45],    size:[0.5,0.5,0.1]},
+    { name:"Base",  color:"#444444",relPos:[0,0.2,0],       size:[1,0.5,1]   },
+  ]},
+  { label:"🗑 Trash Can",icon:"🗑", parts:[
+    { name:"Can",   color:"#555555",relPos:[0,1.5,0],       size:[1.5,3,1.5] },
+    { name:"Lid",   color:"#444444",relPos:[0,3.2,0],       size:[1.7,0.4,1.7]},
+    { name:"Base",  color:"#333333",relPos:[0,0.15,0],      size:[1.7,0.3,1.7]},
+  ]},
+  { label:"🪑 Bench",   icon:"🪑", parts:[
+    { name:"Seat",  color:"#8B5E3C",relPos:[0,1.2,0],       size:[4,0.2,1.2] },
+    { name:"Back",  color:"#8B5E3C",relPos:[0,2,0.5],       size:[4,1.5,0.2] },
+    { name:"Leg1",  color:"#6b4020",relPos:[-1.6,0.6,0],   size:[0.3,1.2,1.2]},
+    { name:"Leg2",  color:"#6b4020",relPos:[1.6,0.6,0],    size:[0.3,1.2,1.2]},
+  ]},
+  { label:"🏆 Trophy",  icon:"🏆", parts:[
+    { name:"Cup",   color:"#d4ac0d",relPos:[0,3,0],         size:[2,2,2]     },
+    { name:"Handle1",color:"#c49b00",relPos:[-1.3,3,0],    size:[0.5,1.5,0.5]},
+    { name:"Handle2",color:"#c49b00",relPos:[1.3,3,0],     size:[0.5,1.5,0.5]},
+    { name:"Stem",  color:"#d4ac0d",relPos:[0,1.5,0],       size:[0.8,2,0.8] },
+    { name:"Base",  color:"#c49b00",relPos:[0,0.4,0],       size:[3,0.8,2]   },
+  ]},
+  { label:"🔭 Telescope",icon:"🔭", parts:[
+    { name:"Tube",  color:"#2c3e50",relPos:[0,3,0],         size:[5,1,1]     },
+    { name:"Eyepc", color:"#1a252f",relPos:[-2.3,3,0],      size:[0.8,0.8,0.8]},
+    { name:"Lens",  color:"#87ceeb",relPos:[2.3,3,0],       size:[1,1.2,1.2] },
+    { name:"TripodL",color:"#34495e",relPos:[-0.8,1.5,0.8],size:[0.3,3.5,0.3]},
+    { name:"TripodR",color:"#34495e",relPos:[-0.8,1.5,-0.8],size:[0.3,3.5,0.3]},
+    { name:"TripodB",color:"#34495e",relPos:[0.5,1.5,0],   size:[0.3,3,0.3] },
+  ]},
+  { label:"⚔ Sword",    icon:"⚔", parts:[
+    { name:"Blade", color:"#c0c0c0",relPos:[0,4,0],         size:[0.4,7,0.15]},
+    { name:"Guard", color:"#d4ac0d",relPos:[0,0.8,0],       size:[3,0.4,0.4] },
+    { name:"Handle",color:"#8B4513",relPos:[0,-0.8,0],      size:[0.5,2.5,0.5]},
+    { name:"Pommel",color:"#d4ac0d",relPos:[0,-2.3,0],      size:[0.9,0.9,0.9]},
+  ]},
+  { label:"🛡 Shield",   icon:"🛡", parts:[
+    { name:"Body",  color:"#2980b9",relPos:[0,2,0],         size:[2.5,4,0.4] },
+    { name:"BossX", color:"#d4ac0d",relPos:[0,2,0.25],      size:[2.5,0.35,0.15]},
+    { name:"BossY", color:"#d4ac0d",relPos:[0,2,0.25],      size:[0.35,4,0.15]},
+    { name:"Border",color:"#c0a000",relPos:[0,2,0.15],      size:[2.8,4.3,0.2]},
+  ]},
+  { label:"💎 Crystal",  icon:"💎", parts:[
+    { name:"Main",  color:"#a78bfa",relPos:[0,2.5,0],       size:[1.5,4,1.5] },
+    { name:"SideL", color:"#8b5cf6",relPos:[-1.2,2,0],      size:[1,3,1]     },
+    { name:"SideR", color:"#8b5cf6",relPos:[1.2,2,0],       size:[1,3,1]     },
+    { name:"SideF", color:"#7c3aed",relPos:[0,2,-1.2],      size:[1,2.5,1]   },
+    { name:"SideB", color:"#7c3aed",relPos:[0,2,1.2],       size:[1,2.5,1]   },
+    { name:"Glow",  color:"#c4b5fd",relPos:[0,0.3,0],       size:[2.5,0.6,2.5]},
+  ]},
+  { label:"🎁 Gift Box", icon:"🎁", parts:[
+    { name:"Box",   color:"#e74c3c",relPos:[0,1.5,0],       size:[3,3,3]     },
+    { name:"LidTop",color:"#c0392b",relPos:[0,3.2,0],       size:[3.4,0.5,3.4]},
+    { name:"RibbonX",color:"#f1c40f",relPos:[0,1.5,0],      size:[3.5,3.5,0.35]},
+    { name:"RibbonZ",color:"#f1c40f",relPos:[0,1.5,0],      size:[0.35,3.5,3.5]},
+    { name:"BowL",  color:"#f1c40f",relPos:[-0.6,3.5,0],   size:[1,0.6,0.6] },
+    { name:"BowR",  color:"#f1c40f",relPos:[0.6,3.5,0],    size:[1,0.6,0.6] },
+  ]},
+  { label:"🏋 Dumbbell", icon:"🏋", parts:[
+    { name:"Bar",   color:"#888888",relPos:[0,1,0],         size:[6,0.35,0.35]},
+    { name:"WeightLL",color:"#333",relPos:[-2.5,1,0],       size:[0.5,2,2]   },
+    { name:"WeightLR",color:"#333",relPos:[-2,1,0],         size:[0.5,2,2]   },
+    { name:"WeightRL",color:"#333",relPos:[2,1,0],          size:[0.5,2,2]   },
+    { name:"WeightRR",color:"#333",relPos:[2.5,1,0],        size:[0.5,2,2]   },
+  ]},
+  { label:"🚁 Helicopter",icon:"🚁", parts:[
+    { name:"Body",  color:"#2ecc71",relPos:[0,2,0],         size:[5,2,3]     },
+    { name:"Tail",  color:"#27ae60",relPos:[-4.5,1.5,0],    size:[5,1,1]     },
+    { name:"Blade1",color:"#2c3e50",relPos:[0,3.2,0],       size:[9,0.2,0.5] },
+    { name:"Blade2",color:"#2c3e50",relPos:[0,3.2,0],       size:[0.5,0.2,9] },
+    { name:"TailR", color:"#2c3e50",relPos:[-7,2.2,0.5],    size:[2,0.15,2]  },
+    { name:"SkidL", color:"#1a252f",relPos:[0.5,0.5,1.5],   size:[4,0.3,0.3] },
+    { name:"SkidR", color:"#1a252f",relPos:[0.5,0.5,-1.5],  size:[4,0.3,0.3] },
+  ]},
+  { label:"⚓ Anchor",   icon:"⚓", parts:[
+    { name:"Ring",  color:"#555555",relPos:[0,7,0],         size:[1.5,1.5,0.4]},
+    { name:"Shank", color:"#666666",relPos:[0,4,0],         size:[0.5,6,0.5] },
+    { name:"Stock", color:"#555555",relPos:[0,6.5,0],       size:[4,0.5,0.5] },
+    { name:"Crown", color:"#666666",relPos:[0,1,0],         size:[0.5,0.5,0.5]},
+    { name:"FlkL",  color:"#555555",relPos:[-1.5,1,0],      size:[2.5,0.4,1] },
+    { name:"FlkR",  color:"#555555",relPos:[1.5,1,0],       size:[2.5,0.4,1] },
+  ]},
+  { label:"🎭 Stage",   icon:"🎭", parts:[
+    { name:"Platform",color:"#8B6914",relPos:[0,0.6,0],     size:[12,1.2,8]  },
+    { name:"StepF1",color:"#6b4a10",relPos:[0,-0.1,-5],     size:[10,0.5,1]  },
+    { name:"StepF2",color:"#6b4a10",relPos:[0,-0.4,-6],     size:[10,0.5,1]  },
+    { name:"CurtL", color:"#8B0000",relPos:[-5.5,4,0],      size:[1,6,0.3]   },
+    { name:"CurtR", color:"#8B0000",relPos:[5.5,4,0],       size:[1,6,0.3]   },
+    { name:"Beam",  color:"#333333",relPos:[0,7,0],         size:[12,0.4,0.4]},
+  ]},
+  { label:"🎰 Arcade",  icon:"🎰", parts:[
+    { name:"Cabinet",color:"#2c3e50",relPos:[0,2.5,0],      size:[2.5,5,1.5] },
+    { name:"Screen", color:"#00ff88",relPos:[0,3.5,0.8],    size:[2,2,0.2]   },
+    { name:"Controls",color:"#1a1a1a",relPos:[0,2,0.8],     size:[2,0.8,0.4] },
+    { name:"Stick",  color:"#e74c3c",relPos:[-0.5,2.5,0.9], size:[0.25,0.8,0.25]},
+    { name:"BtnA",   color:"#e74c3c",relPos:[0.5,2.4,0.9],  size:[0.4,0.3,0.3]},
+    { name:"BtnB",   color:"#3498db",relPos:[1,2.4,0.9],    size:[0.4,0.3,0.3]},
+    { name:"Marquee",color:"#f39c12",relPos:[0,5.2,0.6],    size:[2.5,0.8,0.6]},
+  ]},
+  { label:"📺 TV", icon:"📺", parts:[
+    { name:"Screen",color:"#1a1a2e",relPos:[0,3,0.25],      size:[5,3,0.3]   },
+    { name:"Frame", color:"#2c3e50",relPos:[0,3,0.2],       size:[5.4,3.4,0.4]},
+    { name:"Stand", color:"#34495e",relPos:[0,1.1,0],       size:[0.5,2.5,0.5]},
+    { name:"Base",  color:"#2c3e50",relPos:[0,0.2,0],       size:[2.5,0.4,1] },
+  ]},
+  { label:"🖥 Computer",icon:"🖥", parts:[
+    { name:"Monitor",color:"#1e293b",relPos:[0,3,0.2],      size:[4,2.8,0.4] },
+    { name:"Screen", color:"#0ea5e9",relPos:[0,3,0.4],      size:[3.5,2.3,0.1]},
+    { name:"Neck",   color:"#334155",relPos:[0,1.3,0],      size:[0.5,2,0.5] },
+    { name:"Base",   color:"#1e293b",relPos:[0,0.25,0],     size:[3,0.5,2]   },
+    { name:"Keyboard",color:"#334155",relPos:[0,0.4,1.8],   size:[3,0.2,1.2] },
+    { name:"Mouse",  color:"#334155",relPos:[2,0.35,1.8],   size:[0.8,0.2,1.2]},
+  ]},
+  { label:"🎸 Guitar",  icon:"🎸", parts:[
+    { name:"Body",   color:"#8B4513",relPos:[0,2,0],        size:[2.5,3.5,0.5]},
+    { name:"Neck",   color:"#6b3200",relPos:[0,5.5,0],      size:[0.7,5,0.3] },
+    { name:"Head",   color:"#6b3200",relPos:[0,8.3,0],      size:[1.2,1.5,0.3]},
+    { name:"PickGrd",color:"#2c3e50",relPos:[-0.5,2,0.3],   size:[1.2,2.5,0.1]},
+    { name:"String1",color:"#c0c0c0",relPos:[0.3,5,0.3],    size:[0.08,9,0.08]},
+    { name:"String2",color:"#c0c0c0",relPos:[0,5,0.3],      size:[0.08,9,0.08]},
+  ]},
+  { label:"🔒 Safe",    icon:"🔒", parts:[
+    { name:"Body",   color:"#2c3e50",relPos:[0,2,0],        size:[3,4,3]     },
+    { name:"Door",   color:"#34495e",relPos:[0,2,1.6],      size:[2.5,3.5,0.2]},
+    { name:"Handle", color:"#d4ac0d",relPos:[0.8,2,1.8],    size:[0.3,1.5,0.2]},
+    { name:"Dial",   color:"#95a5a6",relPos:[-0.6,2.8,1.8], size:[0.8,0.8,0.2]},
+    { name:"Hinge1", color:"#7f8c8d",relPos:[-1.3,3,1.6],   size:[0.3,0.5,0.3]},
+    { name:"Hinge2", color:"#7f8c8d",relPos:[-1.3,1,1.6],   size:[0.3,0.5,0.3]},
+  ]},
+  { label:"🏗 Crane",   icon:"🏗", parts:[
+    { name:"Base",   color:"#f39c12",relPos:[0,0.5,0],      size:[4,1,4]     },
+    { name:"Tower",  color:"#e67e22",relPos:[0,7,0],        size:[1.5,12,1.5]},
+    { name:"Jib",    color:"#f39c12",relPos:[5,13.5,0],     size:[12,0.5,0.5]},
+    { name:"Counter",color:"#e67e22",relPos:[-3,13.5,0],    size:[5,0.5,0.5] },
+    { name:"Hook",   color:"#888888",relPos:[8,11,0],       size:[0.4,4,0.4] },
+    { name:"Weight", color:"#555555",relPos:[-4.5,12,0],    size:[2,1.5,1.5] },
+  ]},
+  { label:"🎪 Tent",    icon:"🎪", parts:[
+    { name:"Peak",   color:"#e74c3c",relPos:[0,6,0],        size:[0.5,1,0.5] },
+    { name:"RoofF",  color:"#f39c12",relPos:[0,4,-3],       size:[8,0.3,6]   },
+    { name:"RoofB",  color:"#e74c3c",relPos:[0,4,3],        size:[8,0.3,6]   },
+    { name:"SideL",  color:"#f39c12",relPos:[-4,1.5,0],     size:[0.3,3,8]   },
+    { name:"SideR",  color:"#e74c3c",relPos:[4,1.5,0],      size:[0.3,3,8]   },
+    { name:"Pole",   color:"#8B6914",relPos:[0,3,0],        size:[0.5,6,0.5] },
+    { name:"Floor",  color:"#d4b483",relPos:[0,0.1,0],      size:[8,0.2,8]   },
+  ]},
+  { label:"🏊 Pool",    icon:"🏊", parts:[
+    { name:"WallL",  color:"#3498db",relPos:[-4,1.5,0],     size:[0.5,3,8]   },
+    { name:"WallR",  color:"#3498db",relPos:[4,1.5,0],      size:[0.5,3,8]   },
+    { name:"WallF",  color:"#3498db",relPos:[0,1.5,-4],     size:[8,3,0.5]   },
+    { name:"WallB",  color:"#3498db",relPos:[0,1.5,4],      size:[8,3,0.5]   },
+    { name:"Floor",  color:"#2980b9",relPos:[0,0,0],        size:[8,0.4,8]   },
+    { name:"Water",  color:"#00b4d8",relPos:[0,2.2,0],      size:[7.5,0.3,7.5]},
+    { name:"Ladder", color:"#c0c0c0",relPos:[3.5,2.5,3.5],  size:[0.3,5,0.3] },
+  ]},
+  { label:"⛩ Torii",   icon:"⛩", parts:[
+    { name:"PostL",  color:"#e74c3c",relPos:[-3,3,0],       size:[0.6,6,0.6] },
+    { name:"PostR",  color:"#e74c3c",relPos:[3,3,0],        size:[0.6,6,0.6] },
+    { name:"TopBeam",color:"#c0392b",relPos:[0,6.5,0],      size:[8,0.6,0.6] },
+    { name:"MidBeam",color:"#e74c3c",relPos:[0,5,0],        size:[7,0.5,0.5] },
+    { name:"TopL",   color:"#c0392b",relPos:[-4.2,6.8,0],   size:[1,0.5,0.5] },
+    { name:"TopR",   color:"#c0392b",relPos:[4.2,6.8,0],    size:[1,0.5,0.5] },
+  ]},
+  { label:"🗼 Eiffel",  icon:"🗼", parts:[
+    { name:"LegFL",  color:"#95a5a6",relPos:[-3,4,3],       size:[1,8,1]     },
+    { name:"LegFR",  color:"#95a5a6",relPos:[3,4,3],        size:[1,8,1]     },
+    { name:"LegBL",  color:"#95a5a6",relPos:[-3,4,-3],      size:[1,8,1]     },
+    { name:"LegBR",  color:"#95a5a6",relPos:[3,4,-3],       size:[1,8,1]     },
+    { name:"Level1", color:"#7f8c8d",relPos:[0,8.5,0],      size:[8,0.5,8]   },
+    { name:"Mid",    color:"#95a5a6",relPos:[0,14,0],       size:[4,10,4]    },
+    { name:"Level2", color:"#7f8c8d",relPos:[0,19,0],       size:[5,0.5,5]   },
+    { name:"Top",    color:"#bdc3c7",relPos:[0,25,0],        size:[2,10,2]    },
+    { name:"Spire",  color:"#ecf0f1",relPos:[0,32,0],       size:[0.8,5,0.8] },
+  ]},
+  { label:"🏎 Race Car",icon:"🏎", parts:[
+    { name:"Body",   color:"#e74c3c",relPos:[0,0.8,0],      size:[5,1,2.5]   },
+    { name:"Cockpit",color:"#c0392b",relPos:[-0.5,1.5,0],   size:[2.5,0.8,2]  },
+    { name:"Wing1",  color:"#2c3e50",relPos:[-2.5,1.2,0],   size:[0.3,0.3,3.5]},
+    { name:"Wing2",  color:"#2c3e50",relPos:[2,0.7,0],      size:[1.5,0.3,3.5]},
+    { name:"WhlFL",  color:"#111111",relPos:[-2,0.5,1.4],   size:[0.6,1.2,1.2]},
+    { name:"WhlFR",  color:"#111111",relPos:[-2,0.5,-1.4],  size:[0.6,1.2,1.2]},
+    { name:"WhlBL",  color:"#111111",relPos:[2,0.5,1.4],    size:[0.6,1.2,1.2]},
+    { name:"WhlBR",  color:"#111111",relPos:[2,0.5,-1.4],   size:[0.6,1.2,1.2]},
+  ]},
+  { label:"🧙 Wizard Tower",icon:"🧙", parts:[
+    { name:"Base",   color:"#4a3728",relPos:[0,2,0],        size:[5,4,5]     },
+    { name:"Tower",  color:"#5a4738",relPos:[0,8,0],        size:[4,8,4]     },
+    { name:"Roof",   color:"#6b2d5e",relPos:[0,14,0],       size:[5,4,5]     },
+    { name:"Spire",  color:"#9b2d8e",relPos:[0,17,0],       size:[2,4,2]     },
+    { name:"Window", color:"#a78bfa",relPos:[0,9,2.1],      size:[1.5,2,0.3] },
+    { name:"Door",   color:"#2c1a0a",relPos:[0,2.5,2.6],    size:[1.5,3.5,0.2]},
+    { name:"StarL",  color:"#ffd700",relPos:[-0.8,11,2.1],  size:[0.5,0.5,0.1]},
+  ]},
+  { label:"🌋 Volcano", icon:"🌋", parts:[
+    { name:"Base",   color:"#4a3728",relPos:[0,2,0],        size:[12,4,12]   },
+    { name:"Mid",    color:"#5a3a28",relPos:[0,6,0],        size:[8,5,8]     },
+    { name:"Top",    color:"#6b3a28",relPos:[0,10,0],       size:[5,4,5]     },
+    { name:"Crater", color:"#2c1a0a",relPos:[0,12.5,0],     size:[3,1.5,3]   },
+    { name:"Lava1",  color:"#ff4500",relPos:[0,13.2,0],     size:[2.5,0.3,2.5]},
+    { name:"LavaFlow1",color:"#ff6600",relPos:[2,11,2],     size:[2,3,1]     },
+    { name:"LavaFlow2",color:"#ff4500",relPos:[-2,10,0],    size:[1.5,2,1]   },
+  ]},
+  { label:"🌠 Spaceship",icon:"🌠", parts:[
+    { name:"Fuselage",color:"#2c3e50",relPos:[0,2,0],       size:[3,8,3]     },
+    { name:"Wings",  color:"#34495e",relPos:[0,3,0],        size:[10,0.5,3]  },
+    { name:"Nose",   color:"#1abc9c",relPos:[0,7,0],        size:[2,3,2]     },
+    { name:"Engine1",color:"#e74c3c",relPos:[-3,1,0],       size:[1.5,2,1.5] },
+    { name:"Engine2",color:"#e74c3c",relPos:[3,1,0],        size:[1.5,2,1.5] },
+    { name:"Cockpit",color:"#87ceeb",relPos:[0,7,0],        size:[1.5,2,1.5] },
+    { name:"Glow",   color:"#00ffff",relPos:[0,0,0],        size:[2,0.5,2]   },
+  ]},
+  { label:"⛺ Campfire",icon:"⛺", parts:[
+    { name:"Log1",   color:"#6b3a00",relPos:[-0.8,0.4,0],   size:[3,0.5,0.5] },
+    { name:"Log2",   color:"#5a3200",relPos:[0.8,0.4,0],    size:[3,0.5,0.5] },
+    { name:"Flame1", color:"#ff4500",relPos:[0,1.5,0],      size:[1,2,1]     },
+    { name:"Flame2", color:"#ff8c00",relPos:[0,2.2,0],      size:[0.7,1.5,0.7]},
+    { name:"Flame3", color:"#ffff00",relPos:[0,2.8,0],      size:[0.4,1,0.4] },
+    { name:"Rock1",  color:"#555555",relPos:[-1.5,0,0],     size:[0.8,0.5,0.8]},
+    { name:"Rock2",  color:"#444444",relPos:[1.5,0,0],      size:[0.8,0.5,0.8]},
+    { name:"Rock3",  color:"#666666",relPos:[0,0,-1.5],     size:[0.8,0.5,0.8]},
+  ]},
+];
+
+interface TerrainType { id:string; label:string; color:string; color2:string; }
+const TERRAIN_TYPES: TerrainType[] = [
+  { id:"grass",  label:"🌿 Rumput",  color:"#2d7a2d", color2:"#1e5e1e" },
+  { id:"rock",   label:"🪨 Batu",   color:"#7f8c8d", color2:"#6b7b7e" },
+  { id:"dirt",   label:"🟤 Tanah",  color:"#8B6240", color2:"#6b4a2a" },
+  { id:"sand",   label:"🏖 Pasir",  color:"#d2b48c", color2:"#c4a47a" },
+  { id:"snow",   label:"❄️ Salju",  color:"#e8e8f0", color2:"#d0d0e0" },
+  { id:"water",  label:"🌊 Air",    color:"#1a78c2", color2:"#155fa0" },
+  { id:"lava",   label:"🔥 Lava",   color:"#ff4500", color2:"#cc2200" },
+  { id:"forest", label:"🌲 Hutan",  color:"#2d5a27", color2:"#1e3d1a" },
+];
+
+const COLORS  = ["#e74c3c","#3498db","#2ecc71","#f39c12","#9b59b6","#1abc9c","#e67e22","#ecf0f1","#e91e63","#00bcd4"];
+const RAINBOW = ["#ff0000","#ff7700","#ffff00","#00ff00","#0000ff","#8b00ff"];
+const DEFAULT_SKY: SkySettings = { bgColor:"#87CEEB", fogColor:"#87CEEB", fogFar:200, ambientInt:0.6, sunInt:1.2, sunAngle:45 };
+const LS_KEY = "roblox_studio_projects";
+
+// ── Pseudo noise ───────────────────────────────────────────────────────────────
+function pnoise(x: number, z: number, seed: number): number {
+  const s = Math.sin(x * 127.1 + z * 311.7 + seed * 53.3) * 43758.5453;
+  return s - Math.floor(s);
+}
+function smoothH(x: number, z: number, seed: number): number {
+  const corners = (pnoise(x-1,z-1,seed)+pnoise(x+1,z-1,seed)+pnoise(x-1,z+1,seed)+pnoise(x+1,z+1,seed))/16;
+  const sides   = (pnoise(x-1,z,seed)+pnoise(x+1,z,seed)+pnoise(x,z-1,seed)+pnoise(x,z+1,seed))/8;
+  const center  = pnoise(x,z,seed)/4;
+  return corners + sides + center;
+}
+
+// ── Grass InstancedMesh — ONE draw call for ALL grass blades ──────────────────
+const GRASS_GRID = 9;
+const BLADES_PER_CELL = GRASS_GRID * GRASS_GRID;
+
+function makeBlade3DGeo(): THREE.BufferGeometry {
+  const w = 0.11;
+  const h = 0.42;
+  const segs = 3;
+  const positions: number[] = [];
+  const indices:   number[] = [];
+  const normals:   number[] = [];
+
+  for (let s = 0; s <= segs; s++) {
+    const t  = s / segs;
+    const yw = w * (1 - t * 0.9);
+    const y  = h * t;
+    const lx = Math.sin(t * 0.5) * 0.08;
+    positions.push(-yw, y, lx,  yw, y, lx);
+    normals.push(0, 0, 1,  0, 0, 1);
+  }
+  const vstride = (segs + 1) * 2;
+  for (let s = 0; s <= segs; s++) {
+    const t  = s / segs;
+    const yw = w * (1 - t * 0.9);
+    const y  = h * t;
+    const lx = Math.sin(t * 0.5) * 0.08;
+    positions.push( yw, y, lx, -yw, y, lx);
+    normals.push(0, 0, -1,  0, 0, -1);
+  }
+  for (let face = 0; face < 2; face++) {
+    const base = face * vstride;
+    for (let s = 0; s < segs; s++) {
+      const a = base + s * 2, b = a + 1, c = a + 2, d = a + 3;
+      indices.push(a, b, c,  b, d, c);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+  geo.setAttribute("normal",   new THREE.BufferAttribute(new Float32Array(normals),   3));
+  geo.setIndex(indices);
+  return geo;
+}
+
+let _bladeGeo: THREE.BufferGeometry | null = null;
+function getBladeGeo(): THREE.BufferGeometry {
+  if (!_bladeGeo) _bladeGeo = makeBlade3DGeo();
+  return _bladeGeo;
+}
+
+// ── Grass blade metadata for wind animation ────────────────────────────────────
+interface BladeData {
+  bx: number; bz: number; topY: number;
+  scaleH: number; leanX: number; leanZ: number; rotY: number;
+  phase: number; // random per-blade phase offset for varied sway
+}
+
+let grassBladeData: BladeData[] = [];
+
+function rebuildGrassInstanced(
+  scene: THREE.Scene,
+  instRef: React.MutableRefObject<THREE.InstancedMesh | null>,
+  grassTopMap: React.MutableRefObject<Record<string, THREE.Mesh>>,
+  grassCells: SceneObj[]
+) {
+  if (instRef.current) {
+    scene.remove(instRef.current);
+    (instRef.current.material as THREE.Material).dispose();
+    instRef.current = null;
+  }
+  Object.values(grassTopMap.current).forEach(m => {
+    scene.remove(m); m.geometry.dispose(); (m.material as THREE.Material).dispose();
+  });
+  grassTopMap.current = {};
+  grassBladeData = [];
+
+  if (grassCells.length === 0) return;
+
+  const total = grassCells.length * BLADES_PER_CELL;
+  const mat = new THREE.MeshLambertMaterial({ side: THREE.DoubleSide });
+  const inst = new THREE.InstancedMesh(getBladeGeo(), mat, total);
+  inst.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(total * 3), 3);
+  inst.frustumCulled = false;
+
+  const dummy = new THREE.Object3D();
+  const col   = new THREE.Color();
+
+  grassCells.forEach((cell, ci) => {
+    const topY = cell.position[1] + cell.size[1] / 2;
+    const cs   = cell.size[0];
+    const step = cs / GRASS_GRID;
+
+    // solid carpet
+    const carpetGeo = new THREE.PlaneGeometry(cs, cs);
+    carpetGeo.rotateX(-Math.PI / 2);
+    const carpetMat = new THREE.MeshLambertMaterial({ color: "#2d7a1e" });
+    const carpet = new THREE.Mesh(carpetGeo, carpetMat);
+    carpet.position.set(cell.position[0], topY + 0.002, cell.position[2]);
+    carpet.receiveShadow = true;
+    scene.add(carpet);
+    grassTopMap.current[cell.id] = carpet;
+
+    for (let bi = 0; bi < BLADES_PER_CELL; bi++) {
+      const idx = ci * BLADES_PER_CELL + bi;
+      let ri = ci * 10007 + bi * 127;
+      const rng = () => { ri = (ri * 16807 + 1) & 0x7fffffff; return (ri & 0xffff) / 0xffff; };
+
+      const row  = Math.floor(bi / GRASS_GRID);
+      const col2 = bi % GRASS_GRID;
+      const bx = cell.position[0] - cs * 0.5 + (col2 + 0.5) * step + (rng() - 0.5) * step * 0.5;
+      const bz = cell.position[2] - cs * 0.5 + (row  + 0.5) * step + (rng() - 0.5) * step * 0.5;
+      const bh = 0.6 + rng() * 0.55;
+      const lx = (rng() - 0.5) * 0.25;
+      const lz = (rng() - 0.5) * 0.25;
+      const ry = rng() * Math.PI * 2;
+      const phase = rng() * Math.PI * 2;
+
+      // store blade data for wind animation
+      grassBladeData.push({ bx, bz, topY, scaleH: bh, leanX: lx, leanZ: lz, rotY: ry, phase });
+
+      dummy.position.set(bx, topY, bz);
+      dummy.scale.set(1, bh, 1);
+      dummy.rotation.set(lx, ry, lz, "YXZ");
+      dummy.updateMatrix();
+      inst.setMatrixAt(idx, dummy.matrix);
+
+      col.setHSL(0.27 + rng() * 0.06, 0.7 + rng() * 0.2, 0.20 + rng() * 0.16);
+      inst.setColorAt(idx, col);
+    }
+  });
+
+  inst.instanceMatrix.needsUpdate = true;
+  if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+  scene.add(inst);
+  instRef.current = inst;
+}
+
+// ── Wind animation — updates blade matrices every frame ───────────────────────
+const _windDummy = new THREE.Object3D();
+function animateGrassWind(inst: THREE.InstancedMesh, t: number) {
+  const windStrength = 0.18;
+  const windSpeed    = 1.4;
+  const windDirX     = Math.sin(t * 0.3) * 0.6 + 0.4; // slowly shifting direction
+  const windDirZ     = Math.cos(t * 0.25) * 0.4;
+
+  for (let i = 0; i < grassBladeData.length; i++) {
+    const b = grassBladeData[i];
+    // each blade sways with its own phase so they don't all move together
+    const sway = Math.sin(t * windSpeed + b.phase + b.bx * 0.3 + b.bz * 0.2) * windStrength;
+    const gustX = b.leanX + windDirX * sway;
+    const gustZ = b.leanZ + windDirZ * sway;
+
+    _windDummy.position.set(b.bx, b.topY, b.bz);
+    _windDummy.scale.set(1, b.scaleH, 1);
+    _windDummy.rotation.set(gustX, b.rotY, gustZ, "YXZ");
+    _windDummy.updateMatrix();
+    inst.setMatrixAt(i, _windDummy.matrix);
+  }
+  inst.instanceMatrix.needsUpdate = true;
+}
+
+// ── 3-D gizmo helpers ──────────────────────────────────────────────────────────
+function makeCornerLines(mesh: THREE.Mesh): THREE.Group {
+  const grp = new THREE.Group();
+  const bb  = new THREE.Box3().setFromObject(mesh);
+  const mat = new THREE.LineBasicMaterial({ color:0x00d4ff });
+  const pts:[number,number,number][] = [];
+  [bb.min.x,bb.max.x].forEach(cx=>[bb.min.y,bb.max.y].forEach(cy=>[bb.min.z,bb.max.z].forEach(cz=>pts.push([cx,cy,cz]))));
+  const dirs:[number,number,number][] = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+  pts.forEach(([cx,cy,cz])=>dirs.forEach(([dx,dy,dz])=>{
+    const L=0.4;
+    grp.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(cx,cy,cz),new THREE.Vector3(cx+dx*L,cy+dy*L,cz+dz*L)]),mat));
+  }));
+  return grp;
+}
+function makeMoveGizmo(): THREE.Group {
+  const grp=new THREE.Group();
+  [{ color:0xff3333,dir:new THREE.Vector3(1,0,0) },{ color:0x33ff33,dir:new THREE.Vector3(0,1,0) },{ color:0x3399ff,dir:new THREE.Vector3(0,0,1) }].forEach(({color,dir})=>{
+    const mat=new THREE.MeshBasicMaterial({color,depthTest:false});
+    const q=new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0),dir.clone().normalize());
+    const shaft=new THREE.Mesh(new THREE.CylinderGeometry(0.055,0.055,2.2,8),mat);
+    const cone =new THREE.Mesh(new THREE.ConeGeometry(0.15,0.45,8),mat);
+    shaft.quaternion.copy(q); cone.quaternion.copy(q);
+    shaft.position.copy(dir.clone().multiplyScalar(1.1));
+    cone.position.copy(dir.clone().multiplyScalar(2.2+0.225));
+    [shaft,cone].forEach(m=>{ m.renderOrder=999; grp.add(m); });
+  });
+  return grp;
+}
+function makeRotateGizmo(): THREE.Group {
+  const grp=new THREE.Group();
+  [{ color:0xff3333,rot:new THREE.Euler(0,0,Math.PI/2) },{ color:0x33ff33,rot:new THREE.Euler(0,0,0) },{ color:0x3399ff,rot:new THREE.Euler(Math.PI/2,0,0) }].forEach(({color,rot})=>{
+    const ring=new THREE.Mesh(new THREE.TorusGeometry(2.0,0.07,8,48),new THREE.MeshBasicMaterial({color,side:THREE.DoubleSide,depthTest:false}));
+    ring.rotation.copy(rot); ring.renderOrder=999; grp.add(ring);
+  });
+  return grp;
+}
+function makeScaleGizmo(): THREE.Group {
+  const grp = new THREE.Group();
+  const handleDefs = [
+    { axis:"X+", dir:new THREE.Vector3(1,0,0),  color:0xff3333 },
+    { axis:"X-", dir:new THREE.Vector3(-1,0,0), color:0xff3333 },
+    { axis:"Y+", dir:new THREE.Vector3(0,1,0),  color:0x33ff33 },
+    { axis:"Y-", dir:new THREE.Vector3(0,-1,0), color:0x33ff33 },
+    { axis:"Z+", dir:new THREE.Vector3(0,0,1),  color:0x3399ff },
+    { axis:"Z-", dir:new THREE.Vector3(0,0,-1), color:0x3399ff },
+  ];
+  handleDefs.forEach(h => {
+    const mat  = new THREE.MeshBasicMaterial({ color:h.color, depthTest:false });
+    const cube = new THREE.Mesh(new THREE.BoxGeometry(0.65,0.65,0.65), mat);
+    cube.renderOrder = 999;
+    cube.userData.scaleAxis = h.axis;
+    cube.userData.isScaleHandle = true;
+    cube.userData.dir = h.dir.clone();
+    grp.add(cube);
+  });
+  return grp;
+}
+
+// ── Avatar ─────────────────────────────────────────────────────────────────────
+function createAvatar(): THREE.Group {
+  const grp = new THREE.Group();
+  const add = (geo:THREE.BufferGeometry, color:string, x:number, y:number, z:number) => {
+    const m = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({color}));
+    m.position.set(x,y,z); m.castShadow=true; grp.add(m); return m;
+  };
+  add(new THREE.BoxGeometry(0.9,0.9,0.9), "#ffcba4", 0, 2.65, 0);
+  add(new THREE.BoxGeometry(1.2,1.3,0.7), "#3498db", 0, 1.6,  0);
+  add(new THREE.BoxGeometry(0.45,1.2,0.45),"#e74c3c",-0.85,1.6,0);
+  add(new THREE.BoxGeometry(0.45,1.2,0.45),"#e74c3c", 0.85,1.6,0);
+  add(new THREE.BoxGeometry(0.5,1.3,0.5),  "#2c3e50",-0.35,0.4,0);
+  add(new THREE.BoxGeometry(0.5,1.3,0.5),  "#2c3e50", 0.35,0.4,0);
+  add(new THREE.BoxGeometry(0.18,0.18,0.05),"#000000",-0.2,2.7,0.47);
+  add(new THREE.BoxGeometry(0.18,0.18,0.05),"#000000", 0.2,2.7,0.47);
+  return grp;
+}
+
+// ── Baseplate grid texture ────────────────────────────────────────────────────
+let _gridTex: THREE.CanvasTexture | null = null;
+function getGridTexture(): THREE.CanvasTexture {
+  if (_gridTex) return _gridTex;
+  const SIZE = 512, CELLS = 25;
+  const c = document.createElement("canvas");
+  c.width = c.height = SIZE;
+  const ctx = c.getContext("2d")!;
+  for (let r = 0; r < CELLS; r++) {
+    for (let col = 0; col < CELLS; col++) {
+      ctx.fillStyle = (r + col) % 2 === 0 ? "#3d8b47" : "#368040";
+      ctx.fillRect(col * (SIZE / CELLS), r * (SIZE / CELLS), SIZE / CELLS, SIZE / CELLS);
+    }
+  }
+  ctx.strokeStyle = "rgba(0,0,0,0.28)";
+  ctx.lineWidth = 1.5;
+  const step = SIZE / CELLS;
+  for (let i = 0; i <= CELLS; i++) {
+    ctx.beginPath(); ctx.moveTo(i * step, 0); ctx.lineTo(i * step, SIZE); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i * step); ctx.lineTo(SIZE, i * step); ctx.stroke();
+  }
+  _gridTex = new THREE.CanvasTexture(c);
+  _gridTex.wrapS = _gridTex.wrapT = THREE.RepeatWrapping;
+  _gridTex.repeat.set(25, 25);
+  return _gridTex;
+}
+
+function applyMaterial(mesh: THREE.Mesh, obj: SceneObj) {
+  if (obj.type === "baseplate") {
+    mesh.material = new THREE.MeshLambertMaterial({ map: getGridTexture() });
+    return;
+  }
+  const mat = obj.material || "SmoothPlastic";
+  const color = obj.color || "#e74c3c";
+  const trans = obj.transparency || 0;
+  if (mat === "Neon") {
+    mesh.material = new THREE.MeshStandardMaterial({ color, emissive:new THREE.Color(color), emissiveIntensity:1.5 });
+  } else if (mat === "Glass") {
+    mesh.material = new THREE.MeshPhysicalMaterial({ color:"#aaddff", transparent:true, opacity:0.25, roughness:0, metalness:0, side:THREE.DoubleSide });
+  } else {
+    mesh.material = new THREE.MeshLambertMaterial({ color, transparent:trans>0, opacity:1-trans });
+  }
+}
+
+// ── ScriptEditor ───────────────────────────────────────────────────────────────
+function ScriptEditor({ modal, onClose, onSave, onRun }: {
+  modal: ScriptModal; onClose:()=>void;
+  onSave:(id:string,c:string)=>void;
+  onRun:(c:string,name:string)=>void;
+}) {
+  const [content, setContent] = useState(modal.content);
+  const typeColor = modal.type==="script"?"#4ade80":modal.type==="localscript"?"#60a5fa":"#f59e0b";
+  const lines = content.split("\n").length;
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.85)",zIndex:2000,display:"flex",alignItems:"center",justifyContent:"center"}}>
+      <div style={{width:"min(93vw,720px)",height:"min(88vh,600px)",background:"#0d1117",border:"1px solid #374151",borderRadius:10,display:"flex",flexDirection:"column",boxShadow:"0 24px 64px rgba(0,0,0,.8)"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,background:"#111827",borderBottom:"1px solid #374151",padding:"8px 12px",borderRadius:"10px 10px 0 0",flexShrink:0}}>
+          <span style={{fontSize:14}}>📜</span>
+          <span style={{color:typeColor,fontWeight:700,fontSize:11}}>{modal.type}</span>
+          <span style={{color:"#9ca3af",fontSize:12,flex:1}}> — {modal.name}</span>
+          <button onClick={()=>onRun(content,modal.name)} style={{background:"#16a34a",color:"#fff",border:"none",borderRadius:5,padding:"4px 12px",cursor:"pointer",fontSize:11,fontWeight:700,marginRight:4}}>▶ Run</button>
+          <button onClick={()=>{onSave(modal.nodeId,content);onClose();}} style={{background:"#1d4ed8",color:"#fff",border:"none",borderRadius:5,padding:"4px 12px",cursor:"pointer",fontSize:11,fontWeight:700,marginRight:4}}>💾 Save</button>
+          <button onClick={onClose} style={{background:"transparent",color:"#9ca3af",border:"none",cursor:"pointer",fontSize:18,lineHeight:1,padding:"0 4px"}}>✕</button>
+        </div>
+        <div style={{flex:1,overflow:"hidden",display:"flex"}}>
+          <div style={{background:"#0a0e17",borderRight:"1px solid #1f2937",padding:"8px 8px 8px 4px",userSelect:"none",fontFamily:"Menlo,Monaco,'Courier New',monospace",fontSize:13,lineHeight:"20px",color:"#374151",minWidth:36,textAlign:"right",overflowY:"hidden",flexShrink:0}}>
+            {Array.from({length:lines},(_,i)=><div key={i}>{i+1}</div>)}
+          </div>
+          <textarea value={content} onChange={e=>setContent(e.target.value)} spellCheck={false}
+            style={{flex:1,background:"transparent",border:"none",outline:"none",color:"#e5e7eb",fontFamily:"Menlo,Monaco,'Courier New',monospace",fontSize:13,lineHeight:"20px",padding:"8px 12px",resize:"none",overflowY:"auto",whiteSpace:"pre",overflowX:"auto",tabSize:2}}
+            onKeyDown={e=>{
+              if(e.key==="Tab"){e.preventDefault();const t=e.currentTarget,s=t.selectionStart,end=t.selectionEnd;const v=content.slice(0,s)+"  "+content.slice(end);setContent(v);setTimeout(()=>{t.selectionStart=t.selectionEnd=s+2;},0);}
+            }}
+          />
+        </div>
+        <div style={{background:"#111827",borderTop:"1px solid #374151",padding:"4px 12px",fontSize:10,color:"#4b5563",borderRadius:"0 0 10px 10px",flexShrink:0}}>
+          Tab=indent · ▶ Run · 💾 Save · <span style={{color:typeColor}}>Lua 5.1</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Terrain Panel ──────────────────────────────────────────────────────────────
+function TerrainPanel({
+  onClose, onStartPaint, brushActive,
+  onSizeChange, onTypeChange, terrainType, terrainSize,
+  terrainMinH, terrainMaxH, onMinHChange, onMaxHChange,
+  terrainShape, onShapeChange,
+  terrainColors, onColorChange,
+}: {
+  onClose:()=>void; onStartPaint:(active:boolean)=>void; brushActive:boolean;
+  onSizeChange:(s:number)=>void; onTypeChange:(t:string)=>void;
+  terrainType:string; terrainSize:number;
+  terrainMinH:number; terrainMaxH:number;
+  onMinHChange:(v:number)=>void; onMaxHChange:(v:number)=>void;
+  terrainShape:"square"|"circle"; onShapeChange:(s:"square"|"circle")=>void;
+  terrainColors:Record<string,{color:string;color2:string}>;
+  onColorChange:(id:string,key:"color"|"color2",val:string)=>void;
+}) {
+  return (
+    <div style={{position:"fixed",top:"50%",left:"50%",transform:"translate(-50%,-50%)",background:"#1f2937",border:"1px solid #374151",borderRadius:12,padding:0,zIndex:1500,width:330,maxHeight:"90vh",overflowY:"auto",boxShadow:"0 24px 64px rgba(0,0,0,.8)"}}>
+      <div style={{display:"flex",alignItems:"center",background:"#111827",borderRadius:"12px 12px 0 0",padding:"10px 14px",borderBottom:"1px solid #374151",position:"sticky",top:0,zIndex:1}}>
+        <span style={{fontSize:18,marginRight:8}}>⛰</span>
+        <span style={{fontWeight:700,fontSize:13,flex:1}}>Terrain Generator</span>
+        <button onClick={onClose} style={{background:"transparent",border:"none",color:"#9ca3af",cursor:"pointer",fontSize:18}}>✕</button>
+      </div>
+      <div style={{padding:14,display:"flex",flexDirection:"column",gap:12}}>
+        <div>
+          <div style={{fontSize:10,color:"#9ca3af",marginBottom:6,fontWeight:700,textTransform:"uppercase"}}>Tipe Terrain</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4}}>
+            {TERRAIN_TYPES.map(t=>(
+              <button key={t.id} onClick={()=>onTypeChange(t.id)}
+                style={{display:"flex",alignItems:"center",gap:6,padding:"6px 8px",borderRadius:6,
+                  border:`1px solid ${terrainType===t.id?"#00b4d8":"#374151"}`,
+                  background:terrainType===t.id?"rgba(0,180,216,.15)":"transparent",
+                  color:terrainType===t.id?"#00d4ff":"#e5e7eb",cursor:"pointer",fontSize:11}}>
+                <div style={{width:12,height:12,borderRadius:2,background:t.color,flexShrink:0}}/>
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div>
+          <div style={{fontSize:10,color:"#9ca3af",marginBottom:6,fontWeight:700,textTransform:"uppercase"}}>Bentuk Brush</div>
+          <div style={{display:"flex",gap:6}}>
+            {(["square","circle"] as const).map(s=>(
+              <button key={s} onClick={()=>onShapeChange(s)}
+                style={{flex:1,padding:"7px 0",borderRadius:7,
+                  border:`1px solid ${terrainShape===s?"#00b4d8":"#374151"}`,
+                  background:terrainShape===s?"rgba(0,180,216,.15)":"transparent",
+                  color:terrainShape===s?"#00d4ff":"#9ca3af",cursor:"pointer",fontSize:12,fontWeight:600,
+                  display:"flex",alignItems:"center",justifyContent:"center",gap:5}}>
+                {s==="square"?<>■ Kotak</>:<>● Bulat</>}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"#9ca3af",marginBottom:4,fontWeight:700,textTransform:"uppercase"}}>
+            <span>Lebar Area</span>
+            <span style={{color:"#00d4ff"}}>{terrainSize} studs</span>
+          </div>
+          <input type="range" min={4} max={40} step={2} value={terrainSize} onChange={e=>onSizeChange(Number(e.target.value))} style={{width:"100%",accentColor:"#00b4d8"}}/>
+        </div>
+        <div>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"#9ca3af",marginBottom:4,fontWeight:700,textTransform:"uppercase"}}>
+            <span>Tinggi Minimum</span><span style={{color:"#00d4ff"}}>{terrainMinH.toFixed(1)}</span>
+          </div>
+          <input type="range" min={0.1} max={4} step={0.1} value={terrainMinH}
+            onChange={e=>{ const v=Number(e.target.value); onMinHChange(v); if(v>terrainMaxH) onMaxHChange(v); }}
+            style={{width:"100%",accentColor:"#22c55e"}}/>
+        </div>
+        <div>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"#9ca3af",marginBottom:4,fontWeight:700,textTransform:"uppercase"}}>
+            <span>Tinggi Maksimum</span><span style={{color:"#00d4ff"}}>{terrainMaxH.toFixed(1)}</span>
+          </div>
+          <input type="range" min={0.1} max={8} step={0.1} value={terrainMaxH}
+            onChange={e=>{ const v=Number(e.target.value); onMaxHChange(v); if(v<terrainMinH) onMinHChange(v); }}
+            style={{width:"100%",accentColor:"#f59e0b"}}/>
+        </div>
+        {/* Color palette for selected terrain type */}
+        {(()=>{
+          const cur=terrainColors[terrainType]||{color:"#2d7a2d",color2:"#1e5e1e"};
+          const tdef=TERRAIN_TYPES.find(t=>t.id===terrainType);
+          return (
+            <div style={{background:"rgba(255,255,255,.04)",border:"1px solid #374151",borderRadius:8,padding:"10px 12px",display:"flex",flexDirection:"column",gap:8}}>
+              <div style={{fontSize:10,color:"#9ca3af",fontWeight:700,textTransform:"uppercase",marginBottom:2}}>🎨 Warna {tdef?.label||terrainType}</div>
+              <div style={{display:"flex",gap:10,alignItems:"center"}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:9,color:"#6b7280",marginBottom:3}}>Warna 1</div>
+                  <div style={{display:"flex",gap:5,alignItems:"center"}}>
+                    <input type="color" value={cur.color} onChange={e=>onColorChange(terrainType,"color",e.target.value)}
+                      style={{width:36,height:26,border:"1px solid #374151",borderRadius:5,cursor:"pointer",background:"transparent",padding:1}}/>
+                    <span style={{fontSize:10,color:"#e5e7eb",fontFamily:"monospace"}}>{cur.color}</span>
+                  </div>
+                </div>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:9,color:"#6b7280",marginBottom:3}}>Warna 2</div>
+                  <div style={{display:"flex",gap:5,alignItems:"center"}}>
+                    <input type="color" value={cur.color2} onChange={e=>onColorChange(terrainType,"color2",e.target.value)}
+                      style={{width:36,height:26,border:"1px solid #374151",borderRadius:5,cursor:"pointer",background:"transparent",padding:1}}/>
+                    <span style={{fontSize:10,color:"#e5e7eb",fontFamily:"monospace"}}>{cur.color2}</span>
+                  </div>
+                </div>
+              </div>
+              <div style={{display:"flex",gap:4}}>
+                <div style={{flex:1,height:14,borderRadius:4,background:`linear-gradient(90deg,${cur.color},${cur.color2})`}}/>
+              </div>
+              <button onClick={()=>{ onColorChange(terrainType,"color",tdef?.color||cur.color); onColorChange(terrainType,"color2",tdef?.color2||cur.color2); }}
+                style={{background:"transparent",border:"1px solid #374151",color:"#6b7280",borderRadius:5,padding:"3px 0",cursor:"pointer",fontSize:10}}>
+                ↺ Reset ke default
+              </button>
+            </div>
+          );
+        })()}
+        <div style={{background:"rgba(0,180,216,.08)",border:"1px solid rgba(0,180,216,.2)",borderRadius:8,padding:"8px 10px",fontSize:11,color:"#9ca3af"}}>
+          {brushActive
+            ?`🖌 Paint aktif (${terrainShape==="circle"?"●":"■"}) — Klik ground untuk taruh terrain.`
+            :"Klik Mulai Paint, lalu klik ground untuk taruh terrain."}
+        </div>
+        <button onClick={()=>onStartPaint(!brushActive)}
+          style={{background:brushActive?"#dc2626":"#00b4d8",color:"#fff",border:"none",borderRadius:8,padding:"10px 0",cursor:"pointer",fontWeight:700,fontSize:13}}>
+          {brushActive ? "⏹ Stop Paint" : "🖌 Mulai Paint Terrain"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Sky Panel ─────────────────────────────────────────────────────────────────
+function SkyPanel({ sky, onChange, onClose }: { sky:SkySettings; onChange:(s:SkySettings)=>void; onClose:()=>void; }) {
+  const up = (k:keyof SkySettings, v:string|number) => onChange({...sky,[k]:v});
+  return (
+    <div style={{position:"fixed",top:"50%",right:16,transform:"translateY(-50%)",background:"#1f2937",border:"1px solid #374151",borderRadius:12,padding:0,zIndex:1500,width:260,boxShadow:"0 24px 64px rgba(0,0,0,.8)"}}>
+      <div style={{display:"flex",alignItems:"center",background:"#111827",borderRadius:"12px 12px 0 0",padding:"10px 14px",borderBottom:"1px solid #374151"}}>
+        <span style={{fontSize:18,marginRight:8}}>🌤</span>
+        <span style={{fontWeight:700,fontSize:13,flex:1}}>Sky & Lingkungan</span>
+        <button onClick={onClose} style={{background:"transparent",border:"none",color:"#9ca3af",cursor:"pointer",fontSize:18}}>✕</button>
+      </div>
+      <div style={{padding:14,display:"flex",flexDirection:"column",gap:10}}>
+        {([
+          {label:"Warna Langit", key:"bgColor",   type:"color"},
+          {label:"Warna Fog",    key:"fogColor",   type:"color"},
+          {label:"Jarak Fog",    key:"fogFar",     type:"range", min:20, max:500, step:10},
+          {label:"Ambient Light",key:"ambientInt", type:"range", min:0,  max:2,   step:0.1},
+          {label:"Intensitas Matahari",key:"sunInt",type:"range",min:0,  max:3,   step:0.1},
+          {label:"Sudut Matahari",key:"sunAngle",  type:"range", min:0,  max:90,  step:5},
+        ] as {label:string;key:keyof SkySettings;type:string;min?:number;max?:number;step?:number}[]).map(f=>(
+          <div key={f.key}>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"#9ca3af",marginBottom:3}}>
+              <span>{f.label}</span>
+              {f.type==="range"&&<span style={{color:"#00d4ff"}}>{sky[f.key]}</span>}
+            </div>
+            {f.type==="color"
+              ? <input type="color" value={sky[f.key] as string} onChange={e=>up(f.key,e.target.value)} style={{width:"100%",height:28,border:"1px solid #374151",borderRadius:6,cursor:"pointer",background:"transparent"}}/>
+              : <input type="range" min={f.min} max={f.max} step={f.step} value={sky[f.key] as number} onChange={e=>up(f.key,Number(e.target.value))} style={{width:"100%",accentColor:"#00b4d8"}}/>
+            }
+          </div>
+        ))}
+        <button onClick={()=>onChange(DEFAULT_SKY)} style={{background:"transparent",border:"1px solid #374151",color:"#9ca3af",borderRadius:6,padding:"5px 0",cursor:"pointer",fontSize:11}}>Reset Default</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Save Project Modal ─────────────────────────────────────────────────────────
+function SaveProjectModal({ onSave, onClose }: { onSave:(name:string)=>void; onClose:()=>void; }) {
+  const [name, setName] = useState("");
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.75)",zIndex:3000,display:"flex",alignItems:"center",justifyContent:"center"}}>
+      <div style={{background:"#1f2937",border:"1px solid #374151",borderRadius:12,padding:0,width:340,boxShadow:"0 24px 64px rgba(0,0,0,.8)"}}>
+        <div style={{display:"flex",alignItems:"center",background:"#111827",borderRadius:"12px 12px 0 0",padding:"10px 14px",borderBottom:"1px solid #374151"}}>
+          <span style={{fontSize:16,marginRight:8}}>💾</span>
+          <span style={{fontWeight:700,fontSize:13,flex:1}}>Save Project</span>
+          <button onClick={onClose} style={{background:"transparent",border:"none",color:"#9ca3af",cursor:"pointer",fontSize:18}}>✕</button>
+        </div>
+        <div style={{padding:18,display:"flex",flexDirection:"column",gap:12}}>
+          <div style={{fontSize:11,color:"#9ca3af"}}>Masukkan nama untuk project map kamu:</div>
+          <input autoFocus value={name} onChange={e=>setName(e.target.value)}
+            onKeyDown={e=>{ if(e.key==="Enter"&&name.trim()) onSave(name.trim()); }}
+            placeholder="Nama project..."
+            style={{background:"#0d1117",border:"1px solid #374151",borderRadius:6,color:"#e5e7eb",fontSize:13,padding:"8px 10px",outline:"none",width:"100%"}}/>
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={onClose} style={{flex:1,background:"transparent",border:"1px solid #374151",color:"#9ca3af",borderRadius:7,padding:"8px 0",cursor:"pointer",fontSize:12}}>Batal</button>
+            <button onClick={()=>{ if(name.trim()) onSave(name.trim()); }} disabled={!name.trim()}
+              style={{flex:2,background:name.trim()?"#1d4ed8":"#374151",color:name.trim()?"#fff":"#6b7280",border:"none",borderRadius:7,padding:"8px 0",cursor:name.trim()?"pointer":"not-allowed",fontSize:13,fontWeight:700}}>
+              💾 Simpan Project
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Open Project Modal ─────────────────────────────────────────────────────────
+function OpenProjectModal({ onLoad, onDelete, onClose }: {
+  onLoad:(p:SavedProject)=>void; onDelete:(name:string)=>void; onClose:()=>void;
+}) {
+  const [projects, setProjects] = useState<SavedProject[]>([]);
+  useEffect(()=>{
+    try { setProjects(JSON.parse(localStorage.getItem(LS_KEY)||"[]")); } catch { setProjects([]); }
+  },[]);
+  const handleDelete = (name: string) => {
+    onDelete(name);
+    setProjects(p=>p.filter(x=>x.name!==name));
+  };
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.75)",zIndex:3000,display:"flex",alignItems:"center",justifyContent:"center"}}>
+      <div style={{background:"#1f2937",border:"1px solid #374151",borderRadius:12,padding:0,width:400,maxHeight:"80vh",display:"flex",flexDirection:"column",boxShadow:"0 24px 64px rgba(0,0,0,.8)"}}>
+        <div style={{display:"flex",alignItems:"center",background:"#111827",borderRadius:"12px 12px 0 0",padding:"10px 14px",borderBottom:"1px solid #374151",flexShrink:0}}>
+          <span style={{fontSize:16,marginRight:8}}>📂</span>
+          <span style={{fontWeight:700,fontSize:13,flex:1}}>Open Project</span>
+          <button onClick={onClose} style={{background:"transparent",border:"none",color:"#9ca3af",cursor:"pointer",fontSize:18}}>✕</button>
+        </div>
+        <div style={{flex:1,overflowY:"auto",padding:12,display:"flex",flexDirection:"column",gap:8}}>
+          {projects.length===0 ? (
+            <div style={{textAlign:"center",color:"#4b5563",padding:"32px 0",fontSize:12}}>
+              <div style={{fontSize:32,marginBottom:8}}>📭</div>
+              Belum ada project tersimpan.
+            </div>
+          ) : projects.map(p=>(
+            <div key={p.name} style={{background:"#111827",border:"1px solid #374151",borderRadius:8,padding:"10px 12px",display:"flex",flexDirection:"column",gap:8}}>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span style={{fontSize:18}}>🗺</span>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontWeight:700,fontSize:12,color:"#e5e7eb",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name}</div>
+                  <div style={{fontSize:10,color:"#4b5563",marginTop:1}}>{p.date} · {p.objs.length} objects</div>
+                </div>
+              </div>
+              <div style={{display:"flex",gap:6}}>
+                <button onClick={()=>onLoad(p)} style={{flex:1,background:"#1d4ed8",color:"#fff",border:"none",borderRadius:6,padding:"6px 0",cursor:"pointer",fontSize:11,fontWeight:700}}>📂 Load</button>
+                <button onClick={()=>handleDelete(p.name)} style={{flex:1,background:"transparent",color:"#f87171",border:"1px solid #f87171",borderRadius:6,padding:"6px 0",cursor:"pointer",fontSize:11,fontWeight:700}}>🗑 Delete</button>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={{borderTop:"1px solid #374151",padding:"8px 14px",flexShrink:0,textAlign:"right",fontSize:10,color:"#4b5563"}}>
+          {projects.length} project tersimpan
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Tree Node ─────────────────────────────────────────────────────────────────
+function TreeNodeEl({ node, depth, selected, selectedSet, onSelect, onToggle, onPlus, onOpenScript }: {
+  node:TreeNode; depth:number; selected:string|null; selectedSet:Set<string>;
+  onSelect:(id:string,shift:boolean)=>void; onToggle:(id:string)=>void;
+  onPlus:(id:string,e:React.MouseEvent)=>void;
+  onOpenScript:(node:TreeNode)=>void;
+}) {
+  const isScript = node.scriptType!=null;
+  const isSelected = selected===node.id || selectedSet.has(node.id);
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"center",height:24,borderRadius:3,paddingLeft:6+depth*13,paddingRight:4,
+        background:isSelected?"#1d4ed8":"transparent",cursor:"pointer",transition:"background .1s"}}
+        onMouseEnter={e=>{if(!isSelected)(e.currentTarget as HTMLElement).style.background="#1e3a5f";}}
+        onMouseLeave={e=>{if(!isSelected)(e.currentTarget as HTMLElement).style.background="transparent";}}>
+        <span style={{width:14,display:"flex",alignItems:"center",color:"#6b7280",flexShrink:0}}
+          onClick={e=>{e.stopPropagation();onToggle(node.id);}}>
+          {node.children!==undefined?(node.open?"▾":"▸"):" "}
+        </span>
+        <span style={{fontSize:12,marginRight:4,flexShrink:0}}>{node.icon}</span>
+        <span style={{fontSize:11,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}
+          onClick={e=>{ onSelect(node.id,e.shiftKey); if(isScript) onOpenScript(node); }}>
+          {node.name}
+        </span>
+        <button onClick={e=>{e.stopPropagation();onPlus(node.id,e);}}
+          style={{border:"none",background:"transparent",color:"#6b7280",cursor:"pointer",fontSize:14,padding:"0 2px",lineHeight:1,opacity:0.6}} title="Insert">+</button>
+      </div>
+      {node.open && node.children && node.children.map(c=>(
+        <TreeNodeEl key={c.id} node={c} depth={depth+1} selected={selected} selectedSet={selectedSet}
+          onSelect={onSelect} onToggle={onToggle} onPlus={onPlus} onOpenScript={onOpenScript}/>
+      ))}
+    </div>
+  );
+}
+
+// ── File Menu ─────────────────────────────────────────────────────────────────
+function FileMenu({ onSaveProject, onOpenProject }: { onSaveProject:()=>void; onOpenProject:()=>void; }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(()=>{
+    const handler = (e: MouseEvent) => { if(ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener("mousedown", handler);
+    return ()=>document.removeEventListener("mousedown", handler);
+  },[]);
+  return (
+    <div ref={ref} style={{position:"relative",display:"inline-block"}}>
+      <button onClick={()=>setOpen(o=>!o)}
+        style={{background:open?"#1e3a5f":"transparent",color:"#e5e7eb",border:"none",padding:"2px 8px",borderRadius:3,cursor:"pointer",fontSize:11,height:"100%"}}>
+        File
+      </button>
+      {open&&(
+        <div style={{position:"absolute",top:"100%",left:0,background:"#1f2937",border:"1px solid #374151",borderRadius:8,minWidth:180,boxShadow:"0 8px 24px rgba(0,0,0,.7)",zIndex:2000,paddingTop:4,paddingBottom:4}}>
+          <div style={{fontSize:9,color:"#4b5563",padding:"4px 12px 2px",textTransform:"uppercase",letterSpacing:1}}>Project</div>
+          {[
+            { icon:"💾", label:"Save Project", action:()=>{setOpen(false);onSaveProject();} },
+            { icon:"📂", label:"Open Project", action:()=>{setOpen(false);onOpenProject();} },
+          ].map(item=>(
+            <button key={item.label} onClick={item.action}
+              style={{display:"flex",alignItems:"center",gap:8,width:"100%",background:"transparent",border:"none",color:"#e5e7eb",padding:"7px 14px",cursor:"pointer",fontSize:12,textAlign:"left"}}
+              onMouseEnter={e=>(e.currentTarget.style.background="#1e3a5f")}
+              onMouseLeave={e=>(e.currentTarget.style.background="transparent")}>
+              <span>{item.icon}</span> {item.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Main App ───────────────────────────────────────────────────────────────────
+export default function App() {
+  const mountRef   = useRef<HTMLDivElement>(null);
+  const sceneRef   = useRef<THREE.Scene|null>(null);
+  const camRef     = useRef<THREE.PerspectiveCamera|null>(null);
+  const rendRef    = useRef<THREE.WebGLRenderer|null>(null);
+  const meshMap      = useRef<Record<string,THREE.Mesh>>({});
+  const grassInstRef = useRef<THREE.InstancedMesh|null>(null);
+  const grassTopMap  = useRef<Record<string,THREE.Mesh>>({});
+  const waterSurfMap = useRef<Record<string,THREE.Mesh>>({});
+  const helperRef  = useRef<THREE.Group|null>(null);
+  const gizmoRef   = useRef<THREE.Group|null>(null);
+  const scaleGizRef= useRef<THREE.Group|null>(null);
+  const avatarRef  = useRef<THREE.Group|null>(null);
+  const terrIndRef = useRef<THREE.Object3D|null>(null);
+  const ambLightRef= useRef<THREE.AmbientLight|null>(null);
+  const sunRef     = useRef<THREE.DirectionalLight|null>(null);
+  const animRef    = useRef<number>(0);
+  const fileRef    = useRef<HTMLInputElement>(null);
+  const photoParent= useRef("workspace");
+  const playingRef = useRef(false);
+  const scriptedObjs = useRef<Set<string>>(new Set());
+  const rainbowIdx   = useRef(0);
+  const terrainSeed  = useRef(Math.random() * 1000);
+  const prevGrassKey = useRef("");
+
+  // ── FIX: orbit now has px AND pz for full 2D pan ──────────────────────────
+  const orbit    = useRef({ drag:false, btn:-1, lx:0, ly:0, phi:1.2, theta:0.6, r:20, px:0, pz:0 });
+  const playerPos= useRef({ x:0, y:1, z:0, vy:0 });
+  const playLook = useRef({ theta:0, phi:0.15, dragging:false, lx:0, ly:0 });
+  const keysDown = useRef<Record<string,boolean>>({});
+  const editJoy  = useRef({ active:false, startX:0, startY:0, dx:0, dy:0 });
+  const [editJoyKnob, setEditJoyKnob] = useState({x:0,y:0});
+  const playJoy  = useRef({ active:false, startX:0, startY:0, dx:0, dy:0 });
+  const [playJoyKnob, setPlayJoyKnob] = useState({x:0,y:0});
+  const dragMove = useRef({ active:false, objId:"", plane:new THREE.Plane(), startY:0 });
+  const scaleDrag= useRef<{ active:boolean; axis:string; startX:number; startY:number; startSize:[number,number,number]; objId:string; currentSize:[number,number,number]; }>
+    ({ active:false, axis:"", startX:0, startY:0, startSize:[2,2,2], objId:"", currentSize:[2,2,2] });
+  const physicsVel  = useRef<Record<string,number>>({});
+  const objsRef     = useRef<SceneObj[]>([]);
+  const selectedRef = useRef<string|null>(null);
+  const selectedSetRef = useRef<Set<string>>(new Set());
+  const terrainBrushRef = useRef({ active:false, type:"grass", size:16, minH:0.3, maxH:2.0, shape:"square" as "square"|"circle", colors:{} as Record<string,{color:string;color2:string}> });
+
+  const [tool,          setTool]         = useState("select");
+  const [selected,      setSel]          = useState<string|null>(null);
+  const [selectedSet,   setSelSet]       = useState<Set<string>>(new Set());
+  const [tree,          setTree]         = useState<TreeNode[]>(TREE_INIT);
+  const [showTbx,       setShowTbx]      = useState(false);
+  const [tab,           setTab]          = useState("properties");
+  const [log,           setLog]          = useState([
+    "[Studio] Workspace loaded — Roblox Studio Web v0.9",
+    "[Studio] ✅ FIX: Analog edit mode maju/mundur sekarang bisa!",
+    "[Studio] 🌿 Grass wind animation — rumput goyang seperti ada angin.",
+    "[Studio] 💾 File → Save/Open Project.",
+  ]);
+  const [partN,         setPartN]        = useState(0);
+  const [playing,       setPlaying]      = useState(false);
+  const [imenu,         setImenu]        = useState<InsertMenu|null>(null);
+  const [scriptModal,   setScriptModal]  = useState<ScriptModal|null>(null);
+  const [showPanel,     setShowPanel]    = useState(false);
+  const [showLand,      setShowLand]     = useState(false);
+  const [showTerrain,   setShowTerrain]  = useState(false);
+  const [showSky,       setShowSky]      = useState(false);
+  const [physicsSim,    setPhysicsSim]   = useState(false);
+  const [terrainBrush,  setTerrainBrush] = useState(false);
+  const [terrainType,   setTerrainType]  = useState("grass");
+  const [terrainSize,   setTerrainSize]  = useState(16);
+  const [terrainMinH,   setTerrainMinH]  = useState(0.3);
+  const [terrainMaxH,   setTerrainMaxH]  = useState(2.0);
+  const [terrainShape,  setTerrainShape] = useState<"square"|"circle">("square");
+  const [terrainColors, setTerrainColors] = useState<Record<string,{color:string;color2:string}>>(
+    () => Object.fromEntries(TERRAIN_TYPES.map(t => [t.id, {color:t.color, color2:t.color2}]))
+  );
+  const [sky,           setSky]          = useState<SkySettings>(DEFAULT_SKY);
+  const [soundUrl,      setSoundUrl]     = useState("");
+  const [soundPlaying,  setSoundPlaying] = useState(false);
+  const [showSaveModal, setShowSaveModal]= useState(false);
+  const [showOpenModal, setShowOpenModal]= useState(false);
+  const [tbxTab,        setTbxTab]       = useState<"community"|"mine"|"ai">("community");
+  const [myModels,      setMyModels]     = useState<CompoundModel[]>(()=>{try{return JSON.parse(localStorage.getItem("rblx_my_models")||"[]");}catch{return [];}});
+  const audioRef = useRef<HTMLAudioElement|null>(null);
+
+  const [objs, setObjs] = useState<SceneObj[]>([
+    { id:"baseplate", name:"Baseplate",    type:"baseplate", color:"#3a7d44", position:[0,-0.5,0], size:[50,1,50], anchored:true },
+    { id:"spawn",     name:"SpawnLocation",type:"spawn",     color:"#e8e8e8", position:[0,0.5,0],  size:[6,1,6],   anchored:true },
+  ]);
+
+  useEffect(()=>{ objsRef.current=objs; },[objs]);
+  useEffect(()=>{ playingRef.current=playing; },[playing]);
+  useEffect(()=>{ selectedRef.current=selected; },[selected]);
+  useEffect(()=>{ selectedSetRef.current=selectedSet; },[selectedSet]);
+  useEffect(()=>{
+    (window as any).__studioTool = tool;
+    if(tool!=="scale" && scaleGizRef.current) {
+      sceneRef.current?.remove(scaleGizRef.current);
+      scaleGizRef.current = null;
+    }
+  },[tool]);
+
+  useEffect(()=>{
+    terrainBrushRef.current = { active:terrainBrush, type:terrainType, size:terrainSize, minH:terrainMinH, maxH:terrainMaxH, shape:terrainShape, colors:terrainColors };
+  },[terrainBrush,terrainType,terrainSize,terrainMinH,terrainMaxH,terrainShape,terrainColors]);
+
+  useEffect(()=>{
+    const chk=()=>setShowLand(window.innerHeight>window.innerWidth&&window.innerWidth<768);
+    chk(); window.addEventListener("resize",chk);
+    return ()=>window.removeEventListener("resize",chk);
+  },[]);
+
+  useEffect(()=>{
+    const scene=sceneRef.current; if(!scene) return;
+    scene.background=new THREE.Color(sky.bgColor);
+    if(scene.fog){ (scene.fog as THREE.Fog).color.set(sky.fogColor); (scene.fog as THREE.Fog).far=sky.fogFar; }
+    if(ambLightRef.current) ambLightRef.current.intensity=sky.ambientInt;
+    if(sunRef.current){
+      sunRef.current.intensity=sky.sunInt;
+      const rad=sky.sunAngle*Math.PI/180;
+      sunRef.current.position.set(20*Math.cos(rad),40*Math.sin(rad),20);
+    }
+  },[sky]);
+
+  useEffect(()=>{
+    const scene=sceneRef.current; if(!scene) return;
+    const grassCells = objs.filter(o=>o.type==="terrain" && o.name==="grass");
+    const key = grassCells.map(o=>o.id).join("|");
+    if(key === prevGrassKey.current) return;
+    prevGrassKey.current = key;
+    rebuildGrassInstanced(scene, grassInstRef, grassTopMap, grassCells);
+  },[objs]);
+
+  // ── Three.js bootstrap ───────────────────────────────────────────────────────
+  useEffect(()=>{
+    const el=mountRef.current; if(!el) return;
+    const scene=new THREE.Scene();
+    scene.background=new THREE.Color("#87CEEB");
+    scene.fog=new THREE.Fog("#87CEEB",80,200);
+    sceneRef.current=scene;
+    const cam=new THREE.PerspectiveCamera(60,el.clientWidth/el.clientHeight,0.1,500);
+    camRef.current=cam;
+    let rend:THREE.WebGLRenderer;
+    try { rend=new THREE.WebGLRenderer({antialias:true,powerPreference:"low-power"}); }
+    catch { return; }
+    rend.setPixelRatio(Math.min(window.devicePixelRatio,2));
+    rend.setSize(el.clientWidth,el.clientHeight);
+    rend.shadowMap.enabled=true;
+    el.appendChild(rend.domElement);
+    rendRef.current=rend;
+    scene.add(new THREE.GridHelper(50,50,"#555","#333"));
+    const amb=new THREE.AmbientLight(0xffffff,0.6);
+    scene.add(amb); ambLightRef.current=amb;
+    const sun=new THREE.DirectionalLight(0xfff4e0,1.2);
+    sun.position.set(20,40,20); sun.castShadow=true;
+    sun.shadow.mapSize.set(2048,2048); scene.add(sun); sunRef.current=sun;
+
+    let frame=0;
+    const clock = new THREE.Clock();
+
+    const loop=()=>{
+      animRef.current=requestAnimationFrame(loop); frame++;
+      const t = clock.getElapsedTime();
+      const o=orbit.current, p=playerPos.current, k=keysDown.current, look=playLook.current;
+
+      // ── FIX: edit joystick pans in BOTH X and Z ──────────────────────────
+      if(!playingRef.current && editJoy.current.active) {
+        const panSpd=o.r*0.016;
+        // Forward vector in world space (based on camera orbit angle)
+        const fwdX = Math.sin(o.theta);
+        const fwdZ = Math.cos(o.theta);
+        // Right vector
+        const rgtX =  Math.cos(o.theta);
+        const rgtZ = -Math.sin(o.theta);
+        // dx → strafe left/right, dy → forward/backward
+        // NOTE: dy is NEGATIVE when joystick pushed up (screen Y decreases upward).
+        // "Forward" = move view-center in direction camera faces = -(fwdX, fwdZ).
+        // So: px += dy*fwdX  →  (-0.8)*sin(θ)  →  moves center forward ✅
+        o.px += editJoy.current.dx * rgtX * panSpd;
+        o.pz += editJoy.current.dx * rgtZ * panSpd;
+        o.px += editJoy.current.dy * fwdX * panSpd;
+        o.pz += editJoy.current.dy * fwdZ * panSpd;
+      }
+
+      if(physicsSimRef.current) {
+        objsRef.current.forEach(obj=>{
+          if(obj.anchored!==false) return;
+          const mesh=meshMap.current[obj.id]; if(!mesh) return;
+          if(!physicsVel.current[obj.id]) physicsVel.current[obj.id]=0;
+          physicsVel.current[obj.id]-=0.012;
+          mesh.position.y+=physicsVel.current[obj.id];
+          const ground=obj.size[1]/2;
+          if(mesh.position.y<=ground){ mesh.position.y=ground; physicsVel.current[obj.id]=0; }
+        });
+      }
+      if(scriptedObjs.current.size>0){
+        scriptedObjs.current.forEach(id=>{
+          const m=meshMap.current[id]; if(!m) return;
+          m.rotation.y+=0.03;
+          if(frame%8===0){
+            const mat=m.material as THREE.MeshLambertMaterial;
+            if(mat&&mat.color) mat.color.set(RAINBOW[rainbowIdx.current%RAINBOW.length]);
+            rainbowIdx.current++;
+          }
+        });
+      }
+
+      // ── Animate water surfaces — FLAT bob only (no per-vertex, no lag) ───
+      Object.values(waterSurfMap.current).forEach(wm=>{
+        const baseY=wm.userData.baseY as number;
+        // simple vertical bob — no vertex displacement = zero CPU cost
+        wm.position.y = baseY + Math.sin(t*1.6)*0.025 + Math.sin(t*2.3+0.5)*0.015;
+        const mat=wm.material as THREE.MeshStandardMaterial;
+        if(mat.color) mat.color.setHSL(0.565+Math.sin(t*0.4)*0.015, 0.88, 0.40+Math.sin(t*1.3)*0.04);
+        mat.opacity = 0.70+Math.sin(t*0.9)*0.05;
+      });
+
+      // ── Grass wind animation every frame ─────────────────────────────────
+      if(grassInstRef.current && grassBladeData.length > 0) {
+        animateGrassWind(grassInstRef.current, t);
+      }
+
+      if(playingRef.current){
+        const spd=0.12;
+        const fx=Math.sin(look.theta), fz=Math.cos(look.theta);
+        const rx=Math.cos(look.theta), rz=-Math.sin(look.theta);
+        let nx=p.x, nz=p.z;
+        if(k["w"]||k["ArrowUp"])    { nx+=fx*spd; nz+=fz*spd; }
+        if(k["s"]||k["ArrowDown"])  { nx-=fx*spd; nz-=fz*spd; }
+        if(k["a"]||k["ArrowLeft"])  { nx-=rx*spd; nz-=rz*spd; }
+        if(k["d"]||k["ArrowRight"]) { nx+=rx*spd; nz+=rz*spd; }
+        if(k[" "]&&p.y<=1.05) p.vy=0.18;
+        if(playJoy.current.active){
+          const jdx=playJoy.current.dx, jdy=playJoy.current.dy;
+          nx+=(fx*(-jdy)+rx*(-jdx))*spd;
+          nz+=(fz*(-jdy)+rz*(-jdx))*spd;
+        }
+        // ── CanCollide AABB collision ────────────────────────────────────
+        const PR=0.5; // player radius
+        const PH=2.0; // player height
+        let blocked=false;
+        objsRef.current.forEach(obj=>{
+          if(obj.canCollide===false) return;
+          if(obj.type==="terrain"||obj.type==="baseplate") return;
+          const [ox,oy,oz]=obj.position, [sw,sh,sd]=obj.size;
+          const minX=ox-sw/2-PR, maxX=ox+sw/2+PR;
+          const minY=oy-sh/2,    maxY=oy+sh/2+PH*0.5;
+          const minZ=oz-sd/2-PR, maxZ=oz+sd/2+PR;
+          if(nx>minX&&nx<maxX&&p.y>minY&&p.y<maxY&&nz>minZ&&nz<maxZ){blocked=true;}
+        });
+        if(!blocked){p.x=nx;p.z=nz;}
+        p.vy-=0.01; p.y+=p.vy; if(p.y<1){p.y=1;p.vy=0;}
+        const dist=7;
+        const camX=p.x-Math.sin(look.theta)*Math.cos(look.phi)*dist;
+        const camY=p.y+1.5+Math.sin(look.phi)*dist;
+        const camZ=p.z-Math.cos(look.theta)*Math.cos(look.phi)*dist;
+        cam.position.set(camX,camY,camZ);
+        cam.lookAt(p.x,p.y+1.5,p.z);
+        if(avatarRef.current){
+          avatarRef.current.position.set(p.x,p.y,p.z);
+          avatarRef.current.rotation.y=-look.theta+Math.PI;
+          const moving=k["w"]||k["s"]||k["a"]||k["d"]||k["ArrowUp"]||k["ArrowDown"]||k["ArrowLeft"]||k["ArrowRight"]||playJoy.current.active;
+          if(moving){
+            avatarRef.current.children[4].position.y=0.4+Math.sin(frame*0.25)*0.2;
+            avatarRef.current.children[5].position.y=0.4-Math.sin(frame*0.25)*0.2;
+            avatarRef.current.children[2].position.y=1.6-Math.sin(frame*0.25)*0.15;
+            avatarRef.current.children[3].position.y=1.6+Math.sin(frame*0.25)*0.15;
+          } else {
+            [4,5].forEach(i=>{(avatarRef.current?.children[i] as THREE.Mesh).position.y=0.4;});
+            [2,3].forEach(i=>{(avatarRef.current?.children[i] as THREE.Mesh).position.y=1.6;});
+          }
+        }
+      } else {
+        // ── FIX: camera lookAt uses BOTH px and pz ────────────────────────
+        cam.position.set(
+          o.r*Math.sin(o.phi)*Math.sin(o.theta)+o.px,
+          o.r*Math.cos(o.phi),
+          o.r*Math.sin(o.phi)*Math.cos(o.theta)+o.pz
+        );
+        cam.lookAt(o.px, 0, o.pz);
+      }
+      rend.render(scene,cam);
+    };
+    loop();
+    const onResize=()=>{cam.aspect=el.clientWidth/el.clientHeight;cam.updateProjectionMatrix();rend.setSize(el.clientWidth,el.clientHeight);};
+    const onKey=(e:KeyboardEvent)=>{keysDown.current[e.key]=e.type==="keydown";};
+    window.addEventListener("resize",onResize);
+    window.addEventListener("keydown",onKey); window.addEventListener("keyup",onKey);
+    return ()=>{
+      cancelAnimationFrame(animRef.current);
+      window.removeEventListener("resize",onResize);
+      window.removeEventListener("keydown",onKey); window.removeEventListener("keyup",onKey);
+      rend.dispose();
+      if(el.contains(rend.domElement)) el.removeChild(rend.domElement);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+
+  const physicsSimRef = useRef(false);
+  useEffect(()=>{ physicsSimRef.current=physicsSim; },[physicsSim]);
+
+  // ── Terrain visual helpers ────────────────────────────────────────────────────
+  const applyTerrainVisual=(scene:THREE.Scene,mesh:THREE.Mesh,obj:SceneObj)=>{
+    const tname=obj.name;
+    if(tname==="grass"){
+      mesh.material=new THREE.MeshLambertMaterial({color:obj.color});
+    } else if(tname==="water"){
+      // Submerged body — dark blue, slightly transparent
+      mesh.material=new THREE.MeshLambertMaterial({color:"#003366",transparent:true,opacity:0.60});
+      const topY=obj.position[1]+obj.size[1]/2;
+      const cs=obj.size[0];
+      // FLAT surface — only 4 vertices, no subdivision = no lag
+      const wGeo=new THREE.PlaneGeometry(cs,cs,1,1);
+      wGeo.rotateX(-Math.PI/2);
+      const wMat=new THREE.MeshStandardMaterial({
+        color:0x0099cc, transparent:true, opacity:0.72,
+        roughness:0.02, metalness:0.2, side:THREE.DoubleSide,
+      });
+      const wSurf=new THREE.Mesh(wGeo,wMat);
+      wSurf.position.set(obj.position[0],topY+0.02,obj.position[2]);
+      wSurf.userData.isWaterSurf=true;
+      wSurf.userData.baseY=topY+0.02;
+      scene.add(wSurf);
+      waterSurfMap.current[obj.id]=wSurf;
+    } else if(tname==="rock"){
+      mesh.material=new THREE.MeshStandardMaterial({color:obj.color,roughness:0.92,metalness:0.05});
+    } else if(tname==="dirt"){
+      mesh.material=new THREE.MeshLambertMaterial({color:obj.color});
+    } else if(tname==="sand"){
+      mesh.material=new THREE.MeshStandardMaterial({color:obj.color,roughness:0.95,metalness:0.0});
+    } else if(tname==="snow"){
+      mesh.material=new THREE.MeshStandardMaterial({color:"#e8eaf0",roughness:0.7,metalness:0.0,
+        emissive:new THREE.Color("#d0d8ff"),emissiveIntensity:0.06});
+    } else if(tname==="lava"){
+      mesh.material=new THREE.MeshStandardMaterial({
+        color:"#cc2200",roughness:0.85,metalness:0.0,
+        emissive:new THREE.Color("#ff5500"),emissiveIntensity:0.9,
+      });
+    } else if(tname==="forest"){
+      mesh.material=new THREE.MeshLambertMaterial({color:obj.color});
+    } else {
+      applyMaterial(mesh,obj);
+    }
+  };
+
+  // ── Sync scene objects ───────────────────────────────────────────────────────
+  useEffect(()=>{
+    const scene=sceneRef.current; if(!scene) return;
+    const existing=new Set(Object.keys(meshMap.current));
+    objs.forEach(obj=>{
+      existing.delete(obj.id);
+      if(meshMap.current[obj.id]){
+        const m=meshMap.current[obj.id];
+        m.position.set(...obj.position);
+        const g=m.geometry as THREE.BoxGeometry;
+        if(g.parameters&&(g.parameters.width!==obj.size[0]||g.parameters.height!==obj.size[1]||g.parameters.depth!==obj.size[2])){
+          m.geometry.dispose();
+          m.geometry=new THREE.BoxGeometry(...obj.size);
+        }
+        if(!scriptedObjs.current.has(obj.id)){
+          if(obj.type==="terrain") applyTerrainVisual(scene,m,obj);
+          else applyMaterial(m,obj);
+        }
+        return;
+      }
+      const mesh=new THREE.Mesh(new THREE.BoxGeometry(...obj.size));
+      if(obj.type==="terrain") applyTerrainVisual(scene,mesh,obj);
+      else applyMaterial(mesh,obj);
+      mesh.position.set(...obj.position);
+      mesh.castShadow=true; mesh.receiveShadow=true;
+      mesh.userData.id=obj.id;
+      scene.add(mesh); meshMap.current[obj.id]=mesh;
+      if(obj.type==="spawn"){
+        const ring=new THREE.Mesh(new THREE.RingGeometry(2.8,3,32),new THREE.MeshBasicMaterial({color:"#00bfff",side:THREE.DoubleSide}));
+        ring.rotation.x=-Math.PI/2; ring.position.set(obj.position[0],obj.position[1]+0.52,obj.position[2]);
+        scene.add(ring);
+      }
+    });
+    existing.forEach(id=>{
+      const m=meshMap.current[id];
+      if(m){scene.remove(m);m.geometry.dispose();}
+      delete meshMap.current[id];
+      if(waterSurfMap.current[id]){
+        const ws=waterSurfMap.current[id];
+        scene.remove(ws); ws.geometry.dispose();
+        (ws.material as THREE.Material).dispose();
+        delete waterSurfMap.current[id];
+      }
+      if(grassTopMap.current[id]){
+        const gt=grassTopMap.current[id];
+        scene.remove(gt); gt.geometry.dispose();
+        (gt.material as THREE.Material).dispose();
+        delete grassTopMap.current[id];
+      }
+    });
+  },[objs]);
+
+  // ── Selection corner ─────────────────────────────────────────────────────────
+  useEffect(()=>{
+    const scene=sceneRef.current; if(!scene) return;
+    if(helperRef.current){scene.remove(helperRef.current);helperRef.current=null;}
+    if(selected&&meshMap.current[selected]){
+      const h=makeCornerLines(meshMap.current[selected]);
+      scene.add(h); helperRef.current=h;
+    }
+  },[selected,objs]);
+
+  useEffect(()=>{
+    const scene=sceneRef.current; if(!scene) return;
+    if(gizmoRef.current){scene.remove(gizmoRef.current);gizmoRef.current=null;}
+    if(!selected||!meshMap.current[selected]||!(tool==="move"||tool==="rotate")) return;
+    const gizmo=tool==="move"?makeMoveGizmo():makeRotateGizmo();
+    gizmo.position.copy(meshMap.current[selected].position);
+    scene.add(gizmo); gizmoRef.current=gizmo;
+    let raf2=0;
+    const sync=()=>{ if(gizmoRef.current&&meshMap.current[selected]) gizmoRef.current.position.copy(meshMap.current[selected].position); if(gizmoRef.current)raf2=requestAnimationFrame(sync); };
+    raf2=requestAnimationFrame(sync);
+    return ()=>cancelAnimationFrame(raf2);
+  },[tool,selected]);
+
+  useEffect(()=>{
+    const scene=sceneRef.current; if(!scene) return;
+    if(scaleGizRef.current){scene.remove(scaleGizRef.current);scaleGizRef.current=null;}
+    if(!selected||!meshMap.current[selected]||tool!=="scale") return;
+    const giz=makeScaleGizmo();
+    scene.add(giz); scaleGizRef.current=giz;
+    let raf3=0;
+    const syncHandles=()=>{
+      const mesh=meshMap.current[selected]; const grp=scaleGizRef.current;
+      if(!mesh||!grp) return;
+      const bb=new THREE.Box3().setFromObject(mesh);
+      const c=new THREE.Vector3(); bb.getCenter(c);
+      const s=new THREE.Vector3(); bb.getSize(s);
+      const off=0.65;
+      grp.children.forEach(child=>{
+        if(!child.userData.isScaleHandle) return;
+        const dir=child.userData.dir as THREE.Vector3;
+        (child as THREE.Mesh).position.set(c.x+dir.x*(s.x/2+off),c.y+dir.y*(s.y/2+off),c.z+dir.z*(s.z/2+off));
+      });
+      if(scaleGizRef.current) raf3=requestAnimationFrame(syncHandles);
+    };
+    raf3=requestAnimationFrame(syncHandles);
+    return ()=>cancelAnimationFrame(raf3);
+  },[tool,selected]);
+
+  useEffect(()=>{
+    const scene=sceneRef.current; if(!scene) return;
+    if(terrIndRef.current){scene.remove(terrIndRef.current);terrIndRef.current=null;}
+    if(!showTerrain||!terrainBrush) return;
+    const r=terrainSize/2;
+    let ind:THREE.Object3D;
+    if(terrainShape==="circle"){
+      ind=new THREE.Mesh(
+        new THREE.CylinderGeometry(r,r,0.15,40),
+        new THREE.MeshBasicMaterial({color:0x00ff88,transparent:true,opacity:0.35,side:THREE.DoubleSide})
+      );
+    } else {
+      ind=new THREE.Mesh(
+        new THREE.BoxGeometry(terrainSize,0.12,terrainSize),
+        new THREE.MeshBasicMaterial({color:0x00ff88,transparent:true,opacity:0.35,side:THREE.DoubleSide})
+      );
+    }
+    ind.position.y=0.08;
+    scene.add(ind); terrIndRef.current=ind;
+    return ()=>{ if(terrIndRef.current){scene.remove(terrIndRef.current);terrIndRef.current=null;} };
+  },[showTerrain,terrainBrush,terrainSize,terrainShape]);
+
+  // ── Controls ─────────────────────────────────────────────────────────────────
+  useEffect(()=>{
+    const el=mountRef.current; if(!el) return;
+    const o=orbit.current;
+    let pinchD:number|null=null;
+    const ground=new THREE.Plane(new THREE.Vector3(0,1,0),0);
+    const castRay=(cx:number,cy:number)=>{
+      const rect=el.getBoundingClientRect();
+      const mouse=new THREE.Vector2(((cx-rect.left)/rect.width)*2-1,-((cy-rect.top)/rect.height)*2+1);
+      const ray=new THREE.Raycaster();
+      ray.setFromCamera(mouse,camRef.current!);
+      return ray;
+    };
+    const hitGround=(cx:number,cy:number)=>{
+      const ray=castRay(cx,cy);
+      const t=new THREE.Vector3();
+      if(ray.ray.intersectPlane(ground,t)) return t;
+      return null;
+    };
+
+    const placeTerrain=(gx:number,gz:number)=>{
+      const br=terrainBrushRef.current;
+      const ttype=br.type;
+      const tsize=br.size;
+      const minH=br.minH;
+      const maxH=br.maxH;
+      const shape=br.shape;
+      const tdef=TERRAIN_TYPES.find(t=>t.id===ttype)||TERRAIN_TYPES[0];
+      // use custom colors from palette if available
+      const customC = (br.colors as Record<string,{color:string;color2:string}>|undefined)?.[ttype];
+      const c1 = customC ? customC.color  : tdef.color;
+      const c2 = customC ? customC.color2 : tdef.color2;
+      const seed=terrainSeed.current;
+      const cellSize=2;
+      const cells=Math.round(tsize/cellSize);
+      const half=(cells*cellSize)/2;
+      const baseId="terrain_"+Date.now();
+      const radius=tsize/2;
+      const newObjs:SceneObj[]=[];
+      const folderNodeChildren:{id:string;name:string;icon:string;children:never[]}[]=[];
+
+      for(let xi=0;xi<cells;xi++) for(let zi=0;zi<cells;zi++){
+        const wx=gx-half+xi*cellSize+cellSize/2;
+        const wz=gz-half+zi*cellSize+cellSize/2;
+        if(shape==="circle"){
+          const dx=wx-gx, dz=wz-gz;
+          if(Math.sqrt(dx*dx+dz*dz)>radius) continue;
+        }
+        const n=smoothH(xi,zi,seed);
+        // Water cells are ALWAYS flat height — prevents uneven surface
+        const h=ttype==="water" ? 0.3 : (minH+(n*(maxH-minH)));
+        const id=baseId+"_"+xi+"_"+zi;
+        const useColor=((xi+zi)%2===0)?c1:c2;
+        const pos:[number,number,number]=[wx,h/2,wz];
+        const size:[number,number,number]=[cellSize,h,cellSize];
+        newObjs.push({id,name:ttype,type:"terrain",color:useColor,position:pos,size,anchored:true});
+        folderNodeChildren.push({id,name:tdef.label,icon:"🟫",children:[]});
+      }
+      if(newObjs.length===0) return;
+      const folderName=tdef.label+"_"+Math.floor(Date.now()%10000);
+      const folder={id:baseId,name:folderName,icon:tdef.label[0]||"⛰",open:false,children:folderNodeChildren};
+      setObjs(p=>[...p,...newObjs]);
+      setTree(p=>mapTree(p,"workspace",nd=>({...nd,open:true,children:[...(nd.children||[]),folder]})));
+      setLog(p=>[...p,`[Terrain] ${folderName} (${shape}) — ${newObjs.length} cells, H:${minH.toFixed(1)}–${maxH.toFixed(1)}`]);
+    };
+
+    const onMD=(e:MouseEvent)=>{
+      if(playingRef.current){ if(e.button===0){playLook.current.dragging=true;playLook.current.lx=e.clientX;playLook.current.ly=e.clientY;} return; }
+      const currentTool=(window as any).__studioTool as string;
+      if(terrainBrushRef.current.active && e.button===0){
+        const gp=hitGround(e.clientX,e.clientY);
+        if(gp){placeTerrain(gp.x,gp.z);e.preventDefault();return;}
+      }
+      if(e.button===0){
+        if(currentTool==="scale" && scaleGizRef.current){
+          const ray=castRay(e.clientX,e.clientY);
+          const handles=scaleGizRef.current.children.filter(c=>c.userData.isScaleHandle);
+          const hits=ray.intersectObjects(handles);
+          if(hits.length>0){
+            const cube=hits[0].object as THREE.Mesh;
+            const axis=cube.userData.scaleAxis as string;
+            const selId=selectedRef.current;
+            const selObj=objsRef.current.find(o=>o.id===selId);
+            if(selObj&&selId){
+              const sz=[...selObj.size] as [number,number,number];
+              scaleDrag.current={active:true,axis,startX:e.clientX,startY:e.clientY,startSize:sz,objId:selId,currentSize:sz};
+              e.preventDefault();return;
+            }
+          }
+        }
+        if(currentTool==="move"){
+          const ray=castRay(e.clientX,e.clientY);
+          const meshes=Object.values(meshMap.current).filter(Boolean);
+          const hits=ray.intersectObjects(meshes);
+          if(hits.length>0){
+            const hitId=hits[0].object.userData.id;
+            const hitMesh=meshMap.current[hitId];
+            if(hitMesh){
+              const dm=dragMove.current;
+              dm.active=true;dm.objId=hitId;dm.startY=hitMesh.position.y;
+              dm.plane.set(new THREE.Vector3(0,1,0),-hitMesh.position.y);
+              e.preventDefault();return;
+            }
+          }
+        }
+      }
+      o.drag=true;o.btn=e.button;o.lx=e.clientX;o.ly=e.clientY;
+    };
+    const onMU=()=>{
+      if(scaleDrag.current.active){
+        const {objId,currentSize}=scaleDrag.current;
+        setObjs(p=>p.map(obj=>obj.id===objId?{...obj,size:currentSize}:obj));
+        if(helperRef.current&&sceneRef.current){sceneRef.current.remove(helperRef.current);helperRef.current=null;}
+      }
+      o.drag=false;dragMove.current.active=false;scaleDrag.current.active=false;
+      playLook.current.dragging=false;
+    };
+    const onMM=(e:MouseEvent)=>{
+      if(playingRef.current){
+        if(playLook.current.dragging){
+          const dx=e.clientX-playLook.current.lx;
+          const dy=e.clientY-playLook.current.ly;
+          playLook.current.lx=e.clientX;
+          playLook.current.ly=e.clientY;
+          playLook.current.theta-=dx*0.004;
+          playLook.current.phi=Math.max(-0.4,Math.min(0.8,playLook.current.phi+dy*0.004));
+        }
+        return;
+      }
+      if(terrainBrushRef.current.active && terrIndRef.current){
+        const gp=hitGround(e.clientX,e.clientY);
+        if(gp) terrIndRef.current.position.set(gp.x,0.08,gp.z);
+      }
+      if(scaleDrag.current.active){
+        const sd=scaleDrag.current;
+        const dx=e.clientX-sd.startX;
+        const dy=sd.startY-e.clientY;
+        const delta=(Math.abs(dx)>Math.abs(dy)?dx:dy)*0.015;
+        const [sx,sy,sz]=sd.startSize;
+        let ns:[number,number,number]=[sx,sy,sz];
+        if(sd.axis==="X+"||sd.axis==="X-") ns=[Math.max(0.4,sx+delta*2),sy,sz];
+        if(sd.axis==="Y+"||sd.axis==="Y-") ns=[sx,Math.max(0.4,sy+delta*2),sz];
+        if(sd.axis==="Z+"||sd.axis==="Z-") ns=[sx,sy,Math.max(0.4,sz+delta*2)];
+        const mesh=meshMap.current[sd.objId];
+        if(mesh){mesh.geometry.dispose();mesh.geometry=new THREE.BoxGeometry(...ns);}
+        sd.currentSize=ns;return;
+      }
+      if(dragMove.current.active){
+        const ray=castRay(e.clientX,e.clientY);
+        const dm=dragMove.current;
+        const pos=new THREE.Vector3();
+        if(ray.ray.intersectPlane(dm.plane,pos)){
+          const id=dm.objId; const mesh=meshMap.current[id];
+          if(mesh){mesh.position.set(pos.x,dm.startY,pos.z);if(helperRef.current)helperRef.current.position.copy(mesh.position);if(gizmoRef.current)gizmoRef.current.position.copy(mesh.position);setObjs(p=>p.map(obj=>obj.id===id?{...obj,position:[pos.x,dm.startY,pos.z]}:obj));}
+        }
+        return;
+      }
+      if(!o.drag) return;
+      const dx=e.clientX-o.lx, dy=e.clientY-o.ly;
+      o.lx=e.clientX;o.ly=e.clientY;
+      if(o.btn===2){o.theta-=dx*0.005;o.phi=Math.max(0.1,Math.min(Math.PI-0.1,o.phi+dy*0.005));}
+      if(o.btn===1){o.px-=dx*0.03;}
+    };
+    const onMW=(e:WheelEvent)=>{ o.r=Math.max(3,Math.min(120,o.r+e.deltaY*0.05)); };
+    const onTS=(e:TouchEvent)=>{
+      if(playingRef.current){if(e.touches.length===1){playLook.current.dragging=true;playLook.current.lx=e.touches[0].clientX;playLook.current.ly=e.touches[0].clientY;}return;}
+      // FIX: don't start orbit when touching the joystick
+      if((e.target as HTMLElement).closest?.('.jswrap')) return;
+      if(editJoy.current.active||playJoy.current.active) return;
+      if(terrainBrushRef.current.active&&e.touches.length===1){
+        const gp=hitGround(e.touches[0].clientX,e.touches[0].clientY);
+        if(gp){placeTerrain(gp.x,gp.z);return;}
+      }
+      if(e.touches.length===1){
+        const currentTool=(window as any).__studioTool as string;
+        if(currentTool==="move"){
+          const ray=castRay(e.touches[0].clientX,e.touches[0].clientY);
+          const hits=ray.intersectObjects(Object.values(meshMap.current).filter(Boolean));
+          if(hits.length>0){const id=hits[0].object.userData.id;const mesh=meshMap.current[id];if(mesh){const dm=dragMove.current;dm.active=true;dm.objId=id;dm.startY=mesh.position.y;dm.plane.set(new THREE.Vector3(0,1,0),-mesh.position.y);return;}}
+        }
+        o.drag=true;o.btn=2;o.lx=e.touches[0].clientX;o.ly=e.touches[0].clientY;
+      }
+      if(e.touches.length===2) pinchD=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);
+    };
+    const onTM=(e:TouchEvent)=>{
+      e.preventDefault();
+      if(playingRef.current){
+        if(e.touches.length===1&&playLook.current.dragging){
+          const dx=e.touches[0].clientX-playLook.current.lx;
+          const dy=e.touches[0].clientY-playLook.current.ly;
+          playLook.current.lx=e.touches[0].clientX;
+          playLook.current.ly=e.touches[0].clientY;
+          playLook.current.theta-=dx*0.004;
+          playLook.current.phi=Math.max(-0.4,Math.min(0.8,playLook.current.phi+dy*0.004));
+        }
+        return;
+      }
+      if(terrainBrushRef.current.active&&terrIndRef.current&&e.touches.length===1){const gp=hitGround(e.touches[0].clientX,e.touches[0].clientY);if(gp) terrIndRef.current.position.set(gp.x,0.08,gp.z);}
+      if(e.touches.length===1){
+        if(dragMove.current.active){const ray=castRay(e.touches[0].clientX,e.touches[0].clientY);const dm=dragMove.current;const pos=new THREE.Vector3();if(ray.ray.intersectPlane(dm.plane,pos)){const id=dm.objId;const mesh=meshMap.current[id];if(mesh){mesh.position.set(pos.x,dm.startY,pos.z);if(helperRef.current)helperRef.current.position.copy(mesh.position);if(gizmoRef.current)gizmoRef.current.position.copy(mesh.position);setObjs(p=>p.map(obj=>obj.id===id?{...obj,position:[pos.x,dm.startY,pos.z]}:obj));}}return;}
+        if(o.drag){const dx=e.touches[0].clientX-o.lx,dy=e.touches[0].clientY-o.ly;o.lx=e.touches[0].clientX;o.ly=e.touches[0].clientY;o.theta-=dx*0.005;o.phi=Math.max(0.1,Math.min(Math.PI-0.1,o.phi+dy*0.005));}
+      }
+      if(e.touches.length===2&&pinchD!==null){const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);o.r=Math.max(3,Math.min(120,o.r-(d-pinchD)*0.05));pinchD=d;}
+    };
+    const onTE=()=>{ o.drag=false;dragMove.current.active=false;scaleDrag.current.active=false;playLook.current.dragging=false;pinchD=null; };
+    el.addEventListener("mousedown",onMD);
+    window.addEventListener("mouseup",onMU);
+    window.addEventListener("mousemove",onMM);
+    el.addEventListener("wheel",onMW,{passive:true});
+    el.addEventListener("contextmenu",e=>e.preventDefault());
+    el.addEventListener("touchstart",onTS,{passive:false});
+    el.addEventListener("touchmove",onTM,{passive:false});
+    el.addEventListener("touchend",onTE);
+    return ()=>{
+      el.removeEventListener("mousedown",onMD);
+      window.removeEventListener("mouseup",onMU);
+      window.removeEventListener("mousemove",onMM);
+      el.removeEventListener("wheel",onMW);
+      el.removeEventListener("touchstart",onTS);
+      el.removeEventListener("touchmove",onTM);
+      el.removeEventListener("touchend",onTE);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+
+  const handleVPClick=useCallback((e:React.MouseEvent)=>{
+    if(playingRef.current||tool!=="select") return;
+    if(dragMove.current.active||scaleDrag.current.active) return;
+    if(terrainBrushRef.current.active) return;
+    const el=mountRef.current!;
+    const rect=el.getBoundingClientRect();
+    const mouse=new THREE.Vector2(((e.clientX-rect.left)/rect.width)*2-1,-((e.clientY-rect.top)/rect.height)*2+1);
+    const ray=new THREE.Raycaster();
+    ray.setFromCamera(mouse,camRef.current!);
+    const hits=ray.intersectObjects(Object.values(meshMap.current).filter(Boolean));
+    if(hits.length>0){
+      const id=hits[0].object.userData.id;
+      if(e.shiftKey){setSelSet(prev=>{const s=new Set(prev);s.has(id)?s.delete(id):s.add(id);return s;});}
+      else{setSel(id);setSelSet(new Set());setTab("properties");setShowPanel(true);}
+    } else {setSel(null);setSelSet(new Set());}
+  },[tool]);
+
+  const insertPart=useCallback((model?:{label:string;color:string;size:[number,number,number];yOff:number})=>{
+    setPartN(prev=>{
+      const n=prev+1;
+      const id="part_"+n+"_"+Date.now();
+      const color=model?model.color:COLORS[n%COLORS.length];
+      const size:[number,number,number]=model?model.size:[2,2,2];
+      const yOff=model?model.yOff:1;
+      const pos:[number,number,number]=[Math.random()*8-4,yOff+size[1]/2,Math.random()*8-4];
+      const name=model?model.label.replace(/^\S+\s/,""):"Part"+n;
+      setObjs(p=>[...p,{id,name,type:"part",color,position:pos,size,anchored:true}]);
+      setTree(p=>mapTree(p,"workspace",nd=>({...nd,open:true,children:[...(nd.children||[]),{id,name,icon:"🟥",children:[]}]})));
+      setSel(id);setTab("properties");setShowPanel(true);
+      setLog(p=>[...p,"[Studio] "+name+" inserted."]);
+      return n;
+    });
+  },[]);
+
+  const insertCompound=useCallback((model:CompoundModel)=>{
+    const baseId="group_"+Date.now();
+    const bx=Math.random()*12-6, bz=Math.random()*12-6;
+    const childNodes:{id:string;name:string;icon:string;children:never[]}[]=[];
+    const newObjs:SceneObj[]=[];
+    model.parts.forEach((p,i)=>{
+      const id=baseId+"_p"+i;
+      const pos:[number,number,number]=[bx+p.relPos[0],p.relPos[1],bz+p.relPos[2]];
+      newObjs.push({id,name:p.name,type:"part",color:p.color,position:pos,size:p.size,anchored:true});
+      childNodes.push({id,name:p.name,icon:"🟥",children:[]});
+    });
+    const folderName=model.label.replace(/^\S+\s/,"");
+    const folder={id:baseId,name:folderName,icon:model.icon,open:true,children:childNodes};
+    setObjs(p=>[...p,...newObjs]);
+    setTree(p=>mapTree(p,"workspace",nd=>({...nd,open:true,children:[...(nd.children||[]),folder]})));
+    setSel(baseId+"_p0");setTab("properties");setShowPanel(true);
+    setLog(p=>[...p,`[Studio] ${folderName} inserted (${model.parts.length} parts).`]);
+  },[]);
+
+  const groupSelected=useCallback(()=>{
+    const ids=selectedSet.size>0?[...selectedSet]:(selected?[selected]:[]);
+    if(ids.length<2){setLog(p=>[...p,"[Studio] Pilih 2+ part (Shift+Click) untuk Group."]);return;}
+    const groupId="Model_"+Date.now();
+    const childNodes=ids.map(id=>{const obj=objsRef.current.find(o=>o.id===id);return{id,name:obj?.name||id,icon:"🟥",children:[]};});
+    const folder={id:groupId,name:"Model",icon:"📦",open:true,children:childNodes};
+    let newTree=tree;
+    ids.forEach(id=>{newTree=removeFromTree(newTree,id);});
+    newTree=mapTree(newTree,"workspace",nd=>({...nd,open:true,children:[...(nd.children||[]),folder]}));
+    setTree(newTree);
+    setSelSet(new Set());setSel(null);
+    setLog(p=>[...p,`[Studio] ${ids.length} parts digrup jadi "Model".`]);
+  },[selected,selectedSet,tree]);
+
+  const deleteSel=useCallback(()=>{
+    if(!selected&&selectedSet.size===0) return;
+    const ids=selectedSet.size>0?[...selectedSet]:[selected!];
+    ids.forEach(id=>{
+      if(id==="baseplate"||id==="spawn") return;
+      scriptedObjs.current.delete(id);
+      setObjs(p=>p.filter(o=>o.id!==id));
+      setTree(p=>removeFromTree(p,id));
+    });
+    setSel(null);setSelSet(new Set());setShowPanel(false);
+    setLog(p=>[...p,`[Studio] ${ids.length} object(s) deleted.`]);
+  },[selected,selectedSet]);
+
+  const toggleNode=useCallback((id:string)=>{
+    setTree(p=>mapTree(p,id,n=>({...n,open:!n.open})));
+  },[]);
+
+  const handlePlus=useCallback((parentId:string,e:React.MouseEvent)=>{
+    const r=(e.currentTarget as HTMLElement).getBoundingClientRect();
+    setImenu({parentId,x:Math.min(r.right+4,window.innerWidth-200),y:Math.min(r.top,window.innerHeight-290)});
+  },[]);
+
+  const openScript=useCallback((node:TreeNode)=>{
+    if(!node.scriptType) return;
+    setScriptModal({nodeId:node.id,name:node.name,type:node.scriptType,content:node.scriptContent||""});
+  },[]);
+
+  const saveScript=useCallback((nodeId:string,content:string)=>{
+    setTree(p=>mapTree(p,nodeId,n=>({...n,scriptContent:content})));
+    setLog(p=>[...p,"[Studio] Script disimpan."]);
+  },[]);
+
+  const runScript=useCallback((content:string,name:string)=>{
+    setLog(p=>[...p,`[Output] Running "${name}"...`]);
+    setObjs(cur=>{
+      cur.filter(o=>o.type==="part").forEach(o=>scriptedObjs.current.add(o.id));
+      if(content.includes("Instance.new")||content.includes("Part")){
+        const id="scripted_"+Date.now();
+        const pos:[number,number,number]=[Math.random()*8-4,3,Math.random()*8-4];
+        scriptedObjs.current.add(id);
+        setTree(p=>mapTree(p,"workspace",nd=>({...nd,open:true,children:[...(nd.children||[]),{id,name:"ScriptedPart",icon:"🟥",children:[]}]})));
+        return [...cur,{id,name:"ScriptedPart",type:"part",color:RAINBOW[0],position:pos,size:[2,2,2],anchored:true}];
+      }
+      return cur;
+    });
+    setLog(p=>[...p,"[Output] ✓ Berhasil!","[Output] → Part rainbow berputar di viewport"]);
+    setTab("output");setShowPanel(true);
+  },[]);
+
+  const handleInsert=useCallback((parentId:string,item:typeof INSERT_ITEMS[0])=>{
+    const id=item.type+"_"+Date.now();
+    const isScript=["script","localscript","modulescript"].includes(item.type);
+    const icon=item.type==="folder"?"📁":isScript?"📜":item.type==="sound"?"🎵":item.type==="textlabel"?"🔤":"🖼";
+    const newNode:TreeNode={id,name:item.name,icon,children:[],open:false,...(isScript?{scriptType:item.type,scriptContent:item.defaultContent||""}:{}),
+      ...(item.type==="sound"?{soundUrl:""}:{})};
+    setTree(p=>mapTree(p,parentId,n=>({...n,open:true,children:[...(n.children||[]),newNode]})));
+    setLog(p=>[...p,"[Studio] "+item.name+" ditambahkan."]);setImenu(null);
+    if(isScript) setTimeout(()=>setScriptModal({nodeId:id,name:item.name,type:item.type,content:item.defaultContent||""}),100);
+  },[]);
+
+  const handlePhoto=useCallback((pid:string)=>{photoParent.current=pid;setImenu(null);fileRef.current?.click();},[]);
+
+  const handleFile=useCallback((e:React.ChangeEvent<HTMLInputElement>)=>{
+    const file=e.target.files?.[0]; if(!file) return;
+    const id="img_"+Date.now(); const name=file.name.replace(/\.[^.]+$/,"");
+    setTree(p=>mapTree(p,photoParent.current,n=>({...n,open:true,children:[...(n.children||[]),{id,name,icon:"🖼",children:[]}]})));
+    const url=URL.createObjectURL(file);
+    new THREE.TextureLoader().load(url,tex=>{
+      const scene=sceneRef.current; if(!scene) return;
+      const m=new THREE.Mesh(new THREE.PlaneGeometry(4,4),new THREE.MeshBasicMaterial({map:tex,side:THREE.DoubleSide}));
+      m.position.set(Math.random()*6-3,2,Math.random()*6-3);m.userData.id=id;
+      scene.add(m);meshMap.current[id]=m as unknown as THREE.Mesh;
+      setObjs(p=>[...p,{id,name,type:"image",color:"#fff",position:[m.position.x,2,m.position.z],size:[4,4,0.1],anchored:true}]);
+    });
+    e.target.value="";
+  },[]);
+
+  const startPlay=()=>{
+    playerPos.current={x:0,y:1,z:0,vy:0};
+    playLook.current={theta:0,phi:0.15,dragging:false,lx:0,ly:0};
+    const scene=sceneRef.current; if(!scene) return;
+    if(avatarRef.current){scene.remove(avatarRef.current);avatarRef.current=null;}
+    const av=createAvatar(); av.position.set(0,1,0);
+    scene.add(av); avatarRef.current=av;
+    setPlaying(true);
+    setLog(p=>[...p,"[Studio] ▶ Playtest. Drag=look, WASD=gerak, Space=lompat."]);
+  };
+  const stopPlay=()=>{
+    setPlaying(false);
+    const scene=sceneRef.current;
+    if(scene&&avatarRef.current){scene.remove(avatarRef.current);avatarRef.current=null;}
+    editJoy.current={active:false,startX:0,startY:0,dx:0,dy:0};
+    playJoy.current={active:false,startX:0,startY:0,dx:0,dy:0};
+    setEditJoyKnob({x:0,y:0});setPlayJoyKnob({x:0,y:0});
+    keysDown.current={};
+    setLog(p=>[...p,"[Studio] ■ Playtest dihentikan."]);
+  };
+
+  const playSound=(url:string)=>{
+    if(audioRef.current){audioRef.current.pause();audioRef.current=null;}
+    if(!url){setLog(p=>[...p,"[Sound] URL kosong."]);return;}
+    const a=new Audio(url); a.loop=true;
+    a.play().then(()=>{setSoundPlaying(true);setLog(p=>[...p,"[Sound] ▶ Playing: "+url]);}).catch(()=>setLog(p=>[...p,"[Sound] ✗ Gagal load audio."]));
+    audioRef.current=a;
+  };
+  const stopSound=()=>{
+    if(audioRef.current){audioRef.current.pause();audioRef.current=null;setSoundPlaying(false);setLog(p=>[...p,"[Sound] ■ Audio stopped."]);}
+  };
+
+  const saveProject=(name:string)=>{
+    const date=new Date().toLocaleString("id-ID",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"});
+    const project:SavedProject={name,date,objs:objsRef.current,tree};
+    try {
+      const existing:SavedProject[]=JSON.parse(localStorage.getItem(LS_KEY)||"[]");
+      const filtered=existing.filter(p=>p.name!==name);
+      filtered.unshift(project);
+      localStorage.setItem(LS_KEY,JSON.stringify(filtered));
+      setLog(p=>[...p,`[Studio] 💾 Project "${name}" tersimpan!`]);
+    } catch { setLog(p=>[...p,"[Studio] ✗ Gagal menyimpan project."]); }
+    setShowSaveModal(false);
+  };
+
+  const loadProject=(project:SavedProject)=>{
+    prevGrassKey.current="";
+    setObjs(project.objs);
+    setTree(project.tree);
+    setSel(null);setSelSet(new Set());setShowPanel(false);
+    setShowOpenModal(false);
+    setLog(p=>[...p,`[Studio] 📂 Project "${project.name}" dimuat!`]);
+  };
+
+  const deleteProject=(name:string)=>{
+    try {
+      const existing:SavedProject[]=JSON.parse(localStorage.getItem(LS_KEY)||"[]");
+      localStorage.setItem(LS_KEY,JSON.stringify(existing.filter(p=>p.name!==name)));
+      setLog(p=>[...p,`[Studio] 🗑 Project "${name}" dihapus.`]);
+    } catch { /* ignore */ }
+  };
+
+  const [showCodeViewer, setShowCodeViewer]=useState(false);
+
+  const exportCode=useCallback(()=>{
+    const blob=new Blob([appSource],{type:"text/plain"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");a.href=url;a.download="RobloxStudioWeb_App.tsx";a.click();
+    URL.revokeObjectURL(url);
+    setLog(p=>[...p,"[Studio] 💾 Source code App.tsx didownload!"]);
+  },[]);
+
+  const selectedObj=objs.find(o=>o.id===selected);
+  const hasSelection=selected||selectedSet.size>0;
+
+  return (
+    <>
+      <style>{`
+        *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+        html,body,#root{overflow:hidden;width:100%;height:100%;}
+        .root{width:100vw;height:100dvh;display:flex;flex-direction:column;background:#111827;color:#e5e7eb;font-family:'Segoe UI',system-ui,sans-serif;font-size:12px;overflow:hidden;}
+        .tbar{height:22px;background:#0a0e17;display:flex;align-items:center;padding:0 8px;gap:1px;border-bottom:1px solid #374151;flex-shrink:0;}
+        .tlogo{font-size:10px;font-weight:800;color:#e94560;letter-spacing:1px;margin-right:6px;white-space:nowrap;}
+        .tmi{padding:1px 6px;border-radius:3px;cursor:pointer;font-size:10px;white-space:nowrap;color:#e5e7eb;}
+        .tmi:hover{background:#1e3a5f;}
+        .toolbar{height:42px;background:#1a3a5c;display:flex;align-items:center;gap:1px;padding:0 4px;border-bottom:1px solid #374151;flex-shrink:0;overflow-x:auto;}
+        .toolbar::-webkit-scrollbar{display:none;}
+        .tsep{width:1px;height:26px;background:#374151;margin:0 3px;flex-shrink:0;}
+        .tbtn{display:flex;flex-direction:column;align-items:center;gap:1px;padding:2px 5px;border-radius:4px;border:none;background:transparent;color:#e5e7eb;cursor:pointer;font-size:8px;min-width:36px;flex-shrink:0;}
+        .tbtn:hover{background:rgba(255,255,255,.08);}
+        .tbtn.on{background:#00b4d8;color:#fff;}
+        .tbtn.warn{background:#f59e0b;color:#000;}
+        .playbtn{display:flex;align-items:center;gap:3px;background:#16a34a;color:#fff;border:none;border-radius:5px;padding:4px 9px;cursor:pointer;font-size:11px;font-weight:700;flex-shrink:0;white-space:nowrap;}
+        .stopbtn{background:#dc2626;}
+        .delbtn{display:flex;align-items:center;gap:3px;background:transparent;color:#f87171;border:1px solid #f87171;border-radius:4px;padding:3px 6px;cursor:pointer;font-size:10px;flex-shrink:0;}
+        .outbtn{display:flex;align-items:center;gap:3px;background:transparent;color:#f59e0b;border:1px solid #f59e0b;border-radius:4px;padding:3px 7px;cursor:pointer;font-size:10px;flex-shrink:0;}
+        .expbtn{display:flex;align-items:center;gap:3px;background:transparent;color:#a78bfa;border:1px solid #a78bfa;border-radius:4px;padding:3px 7px;cursor:pointer;font-size:10px;flex-shrink:0;}
+        .main{flex:1;display:flex;overflow:hidden;min-height:0;}
+        .vp{flex:1;position:relative;overflow:hidden;}
+        .vp canvas{display:block;width:100%!important;height:100%!important;}
+        .vplab{position:absolute;top:6px;left:6px;background:rgba(0,0,0,.55);color:#fff;font-size:9px;padding:2px 7px;border-radius:3px;pointer-events:none;}
+        .toolhint{position:absolute;bottom:6px;left:50%;transform:translateX(-50%);font-size:9px;padding:2px 9px;border-radius:3px;pointer-events:none;white-space:nowrap;}
+        .tbxpop{position:absolute;top:44px;left:50%;transform:translateX(-50%);background:#1f2937;border:1px solid #374151;border-radius:10px;padding:0;z-index:200;box-shadow:0 12px 32px rgba(0,0,0,.7);min-width:260px;max-height:70vh;display:flex;flex-direction:column;}
+        .tbxtabs{display:flex;border-bottom:1px solid #374151;flex-shrink:0;}
+        .tbxtab{flex:1;padding:7px 4px;text-align:center;font-size:10px;cursor:pointer;color:#6b7280;border-bottom:2px solid transparent;}
+        .tbxtab.on{color:#00b4d8;border-bottom-color:#00b4d8;}
+        .tbxgrid{display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:8px;overflow-y:auto;}
+        .tbxi{display:flex;align-items:center;gap:6px;padding:6px 8px;border-radius:5px;cursor:pointer;border:1px solid #374151;font-size:11px;}
+        .tbxi:hover{background:#1e3a5f;}
+        .rp{width:170px;display:flex;flex-direction:column;background:#1f2937;border-left:1px solid #374151;flex-shrink:0;}
+        .rph{background:#111827;padding:5px 8px;font-size:10px;font-weight:700;color:#6b7280;border-bottom:1px solid #374151;display:flex;align-items:center;justify-content:space-between;}
+        .srch{background:#0d1117;border:1px solid #374151;border-radius:4px;color:#e5e7eb;font-size:11px;padding:3px 7px;width:100%;outline:none;margin:3px 0;}
+        .exw{flex:1;overflow-y:auto;padding:2px 0;}
+        .exw::-webkit-scrollbar{width:3px;}
+        .exw::-webkit-scrollbar-thumb{background:#374151;}
+        .imenu{position:fixed;background:#1f2937;border:1px solid #374151;border-radius:8px;padding:5px;z-index:1000;box-shadow:0 8px 24px rgba(0,0,0,.7);min-width:185px;}
+        .imtitle{font-size:9px;color:#6b7280;padding:2px 8px 5px;border-bottom:1px solid #374151;margin-bottom:3px;}
+        .imitem{display:flex;align-items:center;gap:7px;padding:5px 8px;border-radius:4px;cursor:pointer;font-size:11px;}
+        .imitem:hover{background:#1e3a5f;}
+        .bp{background:#1f2937;border-top:1px solid #374151;flex-shrink:0;display:flex;flex-direction:column;transition:height .2s ease;}
+        .bpopen{height:170px;}
+        .bpclosed{height:0;overflow:hidden;border-top:none;}
+        .tabbar{display:flex;align-items:center;border-bottom:1px solid #374151;flex-shrink:0;}
+        .tab{padding:5px 12px;cursor:pointer;font-size:11px;color:#6b7280;border-bottom:2px solid transparent;white-space:nowrap;}
+        .tab.on{color:#00b4d8;border-bottom-color:#00b4d8;}
+        .tabc{flex:1;overflow-y:auto;padding:4px 8px;}
+        .tabc::-webkit-scrollbar{width:3px;}
+        .tabc::-webkit-scrollbar-thumb{background:#374151;}
+        .pempty{color:#6b7280;font-size:11px;padding:16px;text-align:center;}
+        .pst{font-size:9px;font-weight:700;color:#00b4d8;padding:3px 8px;text-transform:uppercase;letter-spacing:.5px;}
+        .pr{display:flex;align-items:center;justify-content:space-between;padding:2px 8px;gap:6px;font-size:11px;color:#6b7280;}
+        .pi{background:#0d1117;border:1px solid #374151;border-radius:3px;color:#e5e7eb;font-size:11px;padding:1px 5px;width:88px;outline:none;}
+        .pc{width:28px;height:17px;border:none;border-radius:3px;cursor:pointer;padding:0;}
+        .psel{background:#0d1117;border:1px solid #374151;border-radius:3px;color:#e5e7eb;font-size:11px;padding:1px 4px;outline:none;}
+        .olog{font-size:10px;color:#7ecfff;padding:1px 0;font-family:monospace;white-space:pre-wrap;}
+        .olog.success{color:#4ade80;}.olog.arrow{color:#f59e0b;}
+        .sbar{height:20px;background:#0a0e17;border-top:1px solid #374151;display:flex;align-items:center;padding:0 10px;gap:10px;font-size:10px;color:#6b7280;flex-shrink:0;}
+        .sdot{width:6px;height:6px;border-radius:50%;background:#22c55e;flex-shrink:0;}
+        .jswrap{position:absolute;pointer-events:auto;display:flex;flex-direction:column;align-items:center;user-select:none;}
+        .jsouter{width:76px;height:76px;border-radius:50%;background:rgba(255,255,255,.1);border:2px solid rgba(255,255,255,.25);display:flex;align-items:center;justify-content:center;position:relative;}
+        .jsinner{width:30px;height:30px;border-radius:50%;background:rgba(255,255,255,.45);position:absolute;box-shadow:0 2px 8px rgba(0,0,0,.5);}
+        .jslabel{font-size:9px;color:rgba(255,255,255,.5);text-align:center;margin-top:3px;}
+        .playov{position:absolute;inset:0;z-index:500;pointer-events:none;}
+        .phud{position:absolute;top:0;left:0;right:0;height:36px;background:rgba(0,150,60,.25);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:space-between;padding:0 12px;pointer-events:auto;font-size:12px;font-weight:600;color:#4ade80;border-bottom:1px solid rgba(22,163,74,.5);}
+        .terrainbadge{position:absolute;top:8px;right:8px;background:rgba(0,255,136,.15);border:1px solid #00ff88;color:#00ff88;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;pointer-events:none;}
+        .scale-legend{position:absolute;top:8px;right:8px;background:rgba(0,0,0,.6);border:1px solid #a855f7;border-radius:6px;padding:6px 10px;font-size:10px;pointer-events:none;display:flex;flex-direction:column;gap:3px;}
+        .gl-row{display:flex;align-items:center;gap:5px;}
+        .gl-dot{width:10px;height:10px;border-radius:2px;flex-shrink:0;}
+        .landprompt{position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:9999;display:flex;align-items:center;justify-content:center;}
+        .lpbox{background:#1f2937;border:1px solid #374151;border-radius:14px;padding:28px 24px;text-align:center;max-width:270px;}
+        .vbadge{position:absolute;top:8px;left:50%;transform:translateX(-50%);background:rgba(16,185,129,.15);border:1px solid #10b981;color:#10b981;border-radius:6px;padding:3px 10px;font-size:10px;font-weight:600;pointer-events:none;white-space:nowrap;}
+      `}</style>
+
+      {showLand&&(
+        <div className="landprompt">
+          <div className="lpbox">
+            <div style={{fontSize:44}}>📱</div>
+            <div style={{fontSize:17,fontWeight:700,margin:"10px 0 7px"}}>Putar Device</div>
+            <div style={{fontSize:12,color:"#6b7280",marginBottom:18}}>Landscape lebih nyaman</div>
+            <button onClick={()=>setShowLand(false)} style={{background:"#00b4d8",color:"#fff",border:"none",borderRadius:7,padding:"9px 22px",cursor:"pointer",fontSize:13,fontWeight:600}}>Lanjut</button>
+          </div>
+        </div>
+      )}
+
+      <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}} onChange={handleFile}/>
+      {scriptModal&&<ScriptEditor modal={scriptModal} onClose={()=>setScriptModal(null)} onSave={saveScript} onRun={runScript}/>}
+      {showTerrain&&<TerrainPanel
+        onClose={()=>{setShowTerrain(false);setTerrainBrush(false);}}
+        onStartPaint={active=>{setTerrainBrush(active);}}
+        brushActive={terrainBrush}
+        onSizeChange={setTerrainSize}
+        onTypeChange={setTerrainType}
+        terrainType={terrainType}
+        terrainSize={terrainSize}
+        terrainMinH={terrainMinH}
+        terrainMaxH={terrainMaxH}
+        onMinHChange={setTerrainMinH}
+        onMaxHChange={setTerrainMaxH}
+        terrainShape={terrainShape}
+        onShapeChange={setTerrainShape}
+        terrainColors={terrainColors}
+        onColorChange={(id,key,val)=>setTerrainColors(p=>({...p,[id]:{...p[id],[key]:val}}))}
+      />}
+      {showSky&&<SkyPanel sky={sky} onChange={setSky} onClose={()=>setShowSky(false)}/>}
+      {showSaveModal&&<SaveProjectModal onSave={saveProject} onClose={()=>setShowSaveModal(false)}/>}
+      {showCodeViewer&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.88)",zIndex:3500,display:"flex",alignItems:"center",justifyContent:"center"}}>
+          <div style={{width:"min(96vw,900px)",height:"min(90vh,680px)",background:"#0d1117",border:"1px solid #374151",borderRadius:12,display:"flex",flexDirection:"column",boxShadow:"0 24px 64px rgba(0,0,0,.9)"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,background:"#111827",borderBottom:"1px solid #374151",padding:"8px 14px",borderRadius:"12px 12px 0 0",flexShrink:0}}>
+              <span style={{fontSize:15}}>📄</span>
+              <span style={{fontWeight:700,fontSize:13,color:"#67e8f9",flex:1}}>RobloxStudioWeb_App.tsx</span>
+              <span style={{fontSize:10,color:"#4b5563",marginRight:8}}>{appSource.split("\n").length} lines · {(appSource.length/1024).toFixed(1)} KB</span>
+              <button onClick={exportCode} style={{background:"#1d4ed8",color:"#fff",border:"none",borderRadius:6,padding:"4px 12px",cursor:"pointer",fontSize:11,fontWeight:700,marginRight:4}}>⬇ Download .tsx</button>
+              <button onClick={()=>{ navigator.clipboard.writeText(appSource); setLog(p=>[...p,"[Studio] ✅ Code disalin ke clipboard!"]); }}
+                style={{background:"#065f46",color:"#6ee7b7",border:"none",borderRadius:6,padding:"4px 12px",cursor:"pointer",fontSize:11,fontWeight:700,marginRight:4}}>📋 Copy All</button>
+              <button onClick={()=>setShowCodeViewer(false)} style={{background:"transparent",color:"#9ca3af",border:"none",cursor:"pointer",fontSize:20,lineHeight:1,padding:"0 4px"}}>✕</button>
+            </div>
+            <div style={{flex:1,overflow:"hidden",display:"flex"}}>
+              <div style={{background:"#0a0e17",borderRight:"1px solid #1f2937",padding:"8px 8px 8px 4px",userSelect:"none",fontFamily:"Menlo,Monaco,'Courier New',monospace",fontSize:12,lineHeight:"19px",color:"#4b5563",minWidth:44,textAlign:"right",overflowY:"hidden",flexShrink:0}}>
+                {appSource.split("\n").map((_,i)=><div key={i}>{i+1}</div>)}
+              </div>
+              <pre style={{flex:1,overflowY:"auto",overflowX:"auto",margin:0,padding:"8px 14px",fontFamily:"Menlo,Monaco,'Courier New',monospace",fontSize:12,lineHeight:"19px",color:"#e5e7eb",whiteSpace:"pre",background:"transparent",tabSize:2}}>
+                {appSource}
+              </pre>
+            </div>
+            <div style={{background:"#111827",borderTop:"1px solid #374151",padding:"4px 14px",fontSize:10,color:"#4b5563",borderRadius:"0 0 12px 12px",flexShrink:0,display:"flex",gap:12}}>
+              <span>📄 App.tsx — file utama Roblox Studio Web</span>
+              <span>·</span>
+              <span style={{color:"#67e8f9"}}>File ini selalu up-to-date setiap ada update fitur</span>
+            </div>
+          </div>
+        </div>
+      )}
+      {showOpenModal&&<OpenProjectModal onLoad={loadProject} onDelete={deleteProject} onClose={()=>setShowOpenModal(false)}/>}
+
+      <div className="root" onClick={()=>imenu&&setImenu(null)}>
+        {/* Title bar */}
+        <div className="tbar">
+          <span className="tlogo">ROBLOX STUDIO</span>
+          <FileMenu onSaveProject={()=>setShowSaveModal(true)} onOpenProject={()=>setShowOpenModal(true)}/>
+          {["Edit","View","Insert","Model","Test","Plugins"].map(m=>(<span key={m} className="tmi">{m}</span>))}
+          <span style={{marginLeft:"auto",fontSize:9,color:"#374151"}}>v0.9</span>
+        </div>
+
+        {/* Toolbar — hidden during play */}
+        {!playing&&<div className="toolbar">
+          {(["select","move","rotate","scale"] as const).map(t=>(
+            <button key={t} className={`tbtn ${tool===t?"on":""}`} onClick={()=>{playClick();setTool(t);}}>
+              {t==="select"?<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 3l14 9-7 1-3 7z"/></svg>
+              :t==="move"?<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2v20M2 12h20"/></svg>
+              :t==="rotate"?<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
+              :<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 3l-6 6M3 21l6-6M21 3h-6M21 3v6M3 21h6M3 21v-6"/></svg>}
+              {t.charAt(0).toUpperCase()+t.slice(1)}
+            </button>
+          ))}
+          <div className="tsep"/>
+          <button className={`tbtn ${showTbx?"on":""}`} onClick={()=>setShowTbx(p=>!p)}>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            Toolbox
+          </button>
+          <button className="tbtn" onClick={()=>insertPart()}>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></svg>
+            Part
+          </button>
+          <div className="tsep"/>
+          <button className={`tbtn ${showTerrain?"on":""}`} onClick={()=>setShowTerrain(p=>!p)}>
+            <span style={{fontSize:14}}>⛰</span> Terrain
+          </button>
+          <button className={`tbtn ${physicsSim?"warn":""}`} onClick={()=>{
+            setPhysicsSim(p=>{
+              if(!p){physicsVel.current={};setLog(pp=>[...pp,"[Physics] Simulasi aktif."]);}
+              else setLog(pp=>[...pp,"[Physics] Simulasi dimatikan."]);
+              return !p;
+            });
+          }}>
+            <span style={{fontSize:14}}>⚛</span>{physicsSim?"Stop Phys":"Physics"}
+          </button>
+          <button className={`tbtn ${showSky?"on":""}`} onClick={()=>setShowSky(p=>!p)}>
+            <span style={{fontSize:14}}>🌤</span> Sky
+          </button>
+          {selectedSet.size>=2&&(
+            <button className="tbtn" onClick={groupSelected} style={{color:"#34d399"}}>
+              <span style={{fontSize:14}}>📦</span> Group
+            </button>
+          )}
+          <div className="tsep"/>
+          {!playing
+            ?<button className="playbtn" onClick={startPlay}>▶ Play</button>
+            :<button className="playbtn stopbtn" onClick={stopPlay}>■ Stop</button>
+          }
+          <button className="outbtn" onClick={()=>{playClick();setTab("output");setShowPanel(true);}}>📋 Output</button>
+          {hasSelection&&!playing&&(<button className="delbtn" onClick={()=>{playClick();deleteSel();}}>🗑 Del</button>)}
+          <button className="expbtn" onClick={()=>{playClick();setShowCodeViewer(true);}} style={{color:"#67e8f9",borderColor:"#67e8f9"}}>📄 Code</button>
+          <button className="expbtn" onClick={()=>{playClick();exportCode();}}>⬇ Download</button>
+        </div>}
+
+        {/* Main area */}
+        <div className="main">
+          <div className="vp" ref={mountRef} onClick={handleVPClick}>
+            <div className="vplab">Camera • Perspective</div>
+
+            {/* Version badge */}
+            <div className="vbadge">🌿 Wind ON · ✅ Analog Fixed · v0.9</div>
+
+            {!playing&&tool==="select"&&<div className="toolhint" style={{background:"rgba(0,0,0,.5)",color:"#9ca3af"}}>RMB=orbit · Scroll=zoom · Klik=select · Shift+Klik=multi-select</div>}
+            {!playing&&tool==="move"&&<div className="toolhint" style={{background:"rgba(0,180,212,.12)",border:"1px solid #00b4d8",color:"#00d4ff"}}>🔵 Move: klik+drag part</div>}
+            {!playing&&tool==="scale"&&(
+              <div className="scale-legend">
+                <div style={{fontSize:9,color:"#c084fc",fontWeight:700,marginBottom:2}}>SCALE HANDLES</div>
+                <div className="gl-row"><div className="gl-dot" style={{background:"#ff3333"}}/><span style={{color:"#ff5555"}}>X+ / X−</span></div>
+                <div className="gl-row"><div className="gl-dot" style={{background:"#33ff33"}}/><span style={{color:"#55ff55"}}>Y+ / Y−</span></div>
+                <div className="gl-row"><div className="gl-dot" style={{background:"#3399ff"}}/><span style={{color:"#55aaff"}}>Z+ / Z−</span></div>
+                <div style={{fontSize:8,color:"#6b7280",marginTop:2}}>Drag handle ■ untuk resize</div>
+              </div>
+            )}
+            {selectedSet.size>0&&!playing&&(
+              <div style={{position:"absolute",top:tool==="scale"?140:8,right:8,background:"rgba(29,78,216,.5)",border:"1px solid #3b82f6",color:"#93c5fd",borderRadius:6,padding:"3px 8px",fontSize:10,pointerEvents:"none"}}>
+                {selectedSet.size} dipilih · Shift+klik tambah/hapus
+              </div>
+            )}
+            {terrainBrush&&<div className="terrainbadge">{terrainShape==="circle"?"●":"■"} Paint Terrain — Klik ground untuk taruh</div>}
+            {showTbx&&(
+              <div className="tbxpop" onClick={e=>e.stopPropagation()}>
+                {/* Toolbox tabs */}
+                <div className="tbxtabs">
+                  {(["community","mine","ai"] as const).map(t=>(
+                    <div key={t} className={`tbxtab ${tbxTab===t?"on":""}`} onClick={()=>{playClick();setTbxTab(t);}}>
+                      {t==="community"?"🌐 Community":t==="mine"?"📦 Mine":"🤖 AI"}
+                    </div>
+                  ))}
+                </div>
+                {/* Mine tab — upload button + my models */}
+                {tbxTab==="mine"&&(
+                  <div style={{padding:8,display:"flex",flexDirection:"column",gap:6}}>
+                    <label style={{display:"flex",alignItems:"center",gap:7,padding:"6px 10px",background:"#1e3a5f",border:"1px dashed #3b82f6",borderRadius:6,cursor:"pointer",fontSize:11,color:"#93c5fd"}}>
+                      <span style={{fontSize:16}}>⬆</span>
+                      <span>Upload Model (JSON)</span>
+                      <input type="file" accept=".json" style={{display:"none"}} onChange={e=>{
+                        const f=e.target.files?.[0]; if(!f) return;
+                        const r=new FileReader(); r.onload=ev=>{
+                          try{
+                            const m=JSON.parse(ev.target?.result as string) as CompoundModel;
+                            if(!m.label||!m.parts) return;
+                            setMyModels(prev=>{const n=[...prev,m];localStorage.setItem("rblx_my_models",JSON.stringify(n));return n;});
+                            playClick();
+                          }catch{}
+                        }; r.readAsText(f);
+                      }}/>
+                    </label>
+                    {myModels.length===0
+                      ? <div style={{textAlign:"center",color:"#4b5563",padding:"16px 0",fontSize:11}}>No models yet.<br/>Upload a JSON model above.</div>
+                      : <div className="tbxgrid">{myModels.map((m,i)=>(
+                          <div key={i} className="tbxi" onClick={()=>{playClick();insertCompound(m);setShowTbx(false);}}>
+                            <span style={{fontSize:15}}>{m.icon||"📦"}</span>
+                            <span style={{fontSize:10,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.label}</span>
+                            <button onPointerDown={e=>e.stopPropagation()} onClick={ev=>{ev.stopPropagation();setMyModels(prev=>{const n=prev.filter((_,j)=>j!==i);localStorage.setItem("rblx_my_models",JSON.stringify(n));return n;});}}
+                              style={{background:"transparent",border:"none",color:"#f87171",cursor:"pointer",fontSize:12,padding:"0 2px"}}>✕</button>
+                          </div>
+                        ))}</div>
+                    }
+                  </div>
+                )}
+                {/* AI tab */}
+                {tbxTab==="ai"&&(
+                  <div style={{padding:16,display:"flex",flexDirection:"column",gap:8,alignItems:"center"}}>
+                    <span style={{fontSize:32}}>🤖</span>
+                    <div style={{fontSize:11,color:"#6b7280",textAlign:"center"}}>AI model generation<br/>coming soon!</div>
+                  </div>
+                )}
+                {/* Community tab */}
+                {tbxTab==="community"&&(
+                  <div className="tbxgrid">
+                    {COMPOUND_TOOLBOX.map(m=>(
+                      <div key={m.label} className="tbxi" onClick={()=>{playClick();insertCompound(m);setShowTbx(false);}}>
+                        <span style={{fontSize:14}}>{m.icon}</span>
+                        <span style={{fontSize:10,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.label.replace(/^\S+\s/,"")}</span>
+                        <span style={{fontSize:8,color:"#6b7280"}}>{m.parts.length}p</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {!playing&&(
+              <div className="jswrap" style={{bottom:50,left:14,cursor:"grab"}}
+                onPointerDown={e=>{e.stopPropagation();e.nativeEvent.stopImmediatePropagation();e.currentTarget.setPointerCapture(e.pointerId);editJoy.current.active=true;editJoy.current.startX=e.clientX;editJoy.current.startY=e.clientY;editJoy.current.dx=0;editJoy.current.dy=0;}}
+                onPointerMove={e=>{e.stopPropagation();if(!editJoy.current.active)return;const dx=Math.max(-1,Math.min(1,(e.clientX-editJoy.current.startX)/36));const dy=Math.max(-1,Math.min(1,(e.clientY-editJoy.current.startY)/36));editJoy.current.dx=dx;editJoy.current.dy=dy;setEditJoyKnob({x:dx*20,y:dy*20});}}
+                onPointerUp={e=>{e.stopPropagation();editJoy.current.active=false;editJoy.current.dx=0;editJoy.current.dy=0;setEditJoyKnob({x:0,y:0});}}>
+                <div className="jsouter">
+                  <div className="jsinner" style={{transform:`translate(${editJoyKnob.x}px,${editJoyKnob.y}px)`,transition:editJoy.current.active?"none":"transform .2s"}}/>
+                </div>
+                <div className="jslabel">Pan Kamera</div>
+              </div>
+            )}
+            {playing&&(
+              <div className="playov">
+                <div className="phud">
+                  <span>▶ PLAYING — Drag=look · WASD/Joystick=move</span>
+                  <button className="playbtn stopbtn" onClick={()=>{playClick();stopPlay();}} style={{pointerEvents:"auto",fontSize:13,padding:"5px 14px",boxShadow:"0 0 16px rgba(220,38,38,.6)"}}>■ Stop</button>
+                </div>
+                {/* Jump button — bottom right */}
+                <button
+                  style={{position:"absolute",bottom:60,right:20,pointerEvents:"auto",width:56,height:56,borderRadius:"50%",background:"rgba(74,222,128,.25)",border:"2px solid rgba(74,222,128,.6)",color:"#4ade80",fontSize:22,fontWeight:700,cursor:"pointer",boxShadow:"0 2px 12px rgba(74,222,128,.3)",backdropFilter:"blur(4px)",zIndex:600}}
+                  onPointerDown={e=>{e.stopPropagation();playerPos.current.vy=0.18;playClick();}}
+                  title="Jump">↑</button>
+                <div className="jswrap" style={{bottom:50,left:14,pointerEvents:"auto"}}
+                  onPointerDown={e=>{e.stopPropagation();e.nativeEvent.stopImmediatePropagation();e.currentTarget.setPointerCapture(e.pointerId);playJoy.current.active=true;playJoy.current.startX=e.clientX;playJoy.current.startY=e.clientY;playJoy.current.dx=0;playJoy.current.dy=0;}}
+                  onPointerMove={e=>{e.stopPropagation();if(!playJoy.current.active)return;const dx=Math.max(-1,Math.min(1,(e.clientX-playJoy.current.startX)/36));const dy=Math.max(-1,Math.min(1,(e.clientY-playJoy.current.startY)/36));playJoy.current.dx=dx;playJoy.current.dy=dy;setPlayJoyKnob({x:dx*20,y:dy*20});}}
+                  onPointerUp={e=>{e.stopPropagation();playJoy.current.active=false;playJoy.current.dx=0;playJoy.current.dy=0;setPlayJoyKnob({x:0,y:0});}}>
+                  <div className="jsouter" style={{border:"2px solid rgba(74,222,128,.4)"}}>
+                    <div className="jsinner" style={{background:"rgba(74,222,128,.6)",transform:`translate(${playJoyKnob.x}px,${playJoyKnob.y}px)`,transition:playJoy.current.active?"none":"transform .2s"}}/>
+                  </div>
+                  <div className="jslabel" style={{color:"rgba(74,222,128,.7)"}}>Move</div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Explorer — hidden during play */}
+          {!playing&&<div className="rp">
+            <div className="rph"><span>Explorer</span><span style={{color:"#e94560",fontSize:9}}>✦ WORKSPACE</span></div>
+            <div style={{padding:"3px 7px"}}><input className="srch" placeholder="Filter..."/></div>
+            <div className="exw">
+              {tree.map(n=>(
+                <TreeNodeEl key={n.id} node={n} depth={0} selected={selected} selectedSet={selectedSet}
+                  onSelect={(id,shift)=>{if(shift){setSelSet(prev=>{const s=new Set(prev);s.has(id)?s.delete(id):s.add(id);return s;});}else{setSel(id);setSelSet(new Set());setTab("properties");setShowPanel(true);}}}
+                  onToggle={toggleNode} onPlus={handlePlus} onOpenScript={openScript}/>
+              ))}
+            </div>
+          </div>}
+        </div>
+
+        {/* Bottom panel */}
+        <div className={`bp ${showPanel?"bpopen":"bpclosed"}`}>
+          <div className="tabbar">
+            <div className={`tab ${tab==="properties"?"on":""}`} onClick={()=>setTab("properties")}>Properties</div>
+            <div className={`tab ${tab==="output"?"on":""}`} onClick={()=>setTab("output")}>Output</div>
+            <div style={{flex:1}}/>
+            <button onClick={()=>setShowPanel(false)} style={{background:"transparent",border:"none",color:"#6b7280",cursor:"pointer",fontSize:16,padding:"0 10px",lineHeight:1}}>✕</button>
+          </div>
+          <div className="tabc">
+            {tab==="properties"?(
+              selectedObj?(
+                <div style={{paddingTop:2}}>
+                  <div className="pst">APPEARANCE</div>
+                  <div className="pr"><span>Name</span><input className="pi" defaultValue={selectedObj.name} key={selectedObj.id+"n"}/></div>
+                  <div className="pr"><span>Color</span>
+                    <input type="color" className="pc" value={selectedObj.color||"#e74c3c"} key={selectedObj.id+"c"}
+                      onChange={e=>{scriptedObjs.current.delete(selectedObj.id);setObjs(p=>p.map(o=>o.id===selected?{...o,color:e.target.value}:o));}}/>
+                  </div>
+                  <div className="pr"><span>Material</span>
+                    <select className="psel" value={selectedObj.material||"SmoothPlastic"} key={selectedObj.id+"m"}
+                      onChange={e=>setObjs(p=>p.map(o=>o.id===selected?{...o,material:e.target.value}:o))}>
+                      <option>SmoothPlastic</option><option>Brick</option><option>Neon</option><option>Wood</option><option>Metal</option><option>Glass</option>
+                    </select>
+                  </div>
+                  <div className="pr"><span>Transparency</span>
+                    <input type="range" min={0} max={0.99} step={0.01} value={selectedObj.transparency||0} className="pi" style={{padding:0,background:"transparent",border:"none"}}
+                      onChange={e=>setObjs(p=>p.map(o=>o.id===selected?{...o,transparency:Number(e.target.value)}:o))}/>
+                  </div>
+                  <div className="pr"><span>Anchored</span>
+                    <input type="checkbox" checked={selectedObj.anchored!==false}
+                      onChange={e=>setObjs(p=>p.map(o=>o.id===selected?{...o,anchored:e.target.checked}:o))}
+                      style={{accentColor:"#00b4d8"}}/>
+                  </div>
+                  <div className="pr"><span>CanCollide</span>
+                    <input type="checkbox" checked={selectedObj.canCollide!==false}
+                      onChange={e=>setObjs(p=>p.map(o=>o.id===selected?{...o,canCollide:e.target.checked}:o))}
+                      style={{accentColor:"#f59e0b"}}/>
+                  </div>
+                  <div className="pst" style={{marginTop:4}}>TRANSFORM</div>
+                  {["X","Y","Z"].map((ax,i)=>(
+                    <div className="pr" key={"p"+ax}><span>Pos {ax}</span>
+                      <input className="pi" value={(selectedObj.position[i]||0).toFixed(2)} key={selectedObj.id+"p"+ax}
+                        onChange={e=>{const v=parseFloat(e.target.value);if(isNaN(v))return;setObjs(p=>p.map(o=>{if(o.id!==selected)return o;const np=[...o.position] as [number,number,number];np[i]=v;return{...o,position:np};}));}}/>
+                    </div>
+                  ))}
+                  {["X","Y","Z"].map((ax,i)=>(
+                    <div className="pr" key={"s"+ax}><span>Size {ax}</span>
+                      <input className="pi" value={(selectedObj.size[i]||2).toFixed(2)} key={selectedObj.id+"s"+ax}
+                        onChange={e=>{const v=parseFloat(e.target.value);if(isNaN(v)||v<0.1)return;setObjs(p=>p.map(o=>{if(o.id!==selected)return o;const ns=[...o.size] as [number,number,number];ns[i]=v;return{...o,size:ns};}));}}/>
+                    </div>
+                  ))}
+                  {(()=>{const node=findInTree(tree,selected||"");return node&&node.soundUrl!==undefined;})()&&(
+                    <>
+                      <div className="pst" style={{marginTop:4}}>SOUND</div>
+                      <div className="pr"><span>URL</span>
+                        <input className="pi" placeholder="https://..." value={soundUrl} onChange={e=>setSoundUrl(e.target.value)} style={{width:120}}/>
+                      </div>
+                      <div className="pr">
+                        <button onClick={()=>playSound(soundUrl)} style={{background:soundPlaying?"transparent":"#16a34a",color:soundPlaying?"#9ca3af":"#fff",border:soundPlaying?"1px solid #374151":"none",borderRadius:4,padding:"3px 8px",cursor:"pointer",fontSize:10}}>{soundPlaying?"Ganti":"▶ Play"}</button>
+                        {soundPlaying&&<button onClick={stopSound} style={{background:"#dc2626",color:"#fff",border:"none",borderRadius:4,padding:"3px 8px",cursor:"pointer",fontSize:10}}>■ Stop</button>}
+                      </div>
+                    </>
+                  )}
+                </div>
+              ):<div className="pempty">Pilih object di viewport atau Explorer</div>
+            ):(
+              log.map((l,i)=>(
+                <div key={i} className={`olog${l.includes("✓")?" success":l.includes("→")?" arrow":""}`}>{l}</div>
+              ))
+            )}
+          </div>
+        </div>
+
+        {/* Status bar */}
+        <div className="sbar">
+          <div className="sdot" style={{background:playing?"#f59e0b":"#22c55e"}}/>
+          <span>{playing?"▶ Playing":(physicsSim?"⚛ Physics":"Ready")}</span>
+          <span>Objs:{objs.length}</span>
+          <span>🌿{objs.filter(o=>o.type==="terrain"&&o.name==="grass").length} cells</span>
+          <span>Tool:{tool}</span>
+          {selected&&<span style={{color:"#00b4d8"}}>Sel:{selected.split("_")[0]}</span>}
+          {selectedSet.size>0&&<span style={{color:"#3b82f6"}}>{selectedSet.size} multi-sel</span>}
+          {!showPanel&&<button onClick={()=>setShowPanel(true)} style={{marginLeft:4,background:"transparent",border:"1px solid #374151",color:"#6b7280",borderRadius:3,padding:"0 6px",cursor:"pointer",fontSize:10}}>▲ Panel</button>}
+          <span style={{marginLeft:"auto"}}>Studio Web v0.9</span>
+        </div>
+
+        {/* Insert menu */}
+        {imenu&&(
+          <div className="imenu" style={{top:imenu.y,left:imenu.x}} onClick={e=>e.stopPropagation()}>
+            <div className="imtitle">Insert ke: {imenu.parentId}</div>
+            {INSERT_ITEMS.map(item=>(
+              <div key={item.type} className="imitem"
+                onClick={()=>item.type==="photo"?handlePhoto(imenu.parentId):handleInsert(imenu.parentId,item)}>
+                <span style={{color:item.color}}>{item.emoji}</span>
+                <span>{item.name}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
